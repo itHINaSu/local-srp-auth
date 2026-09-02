@@ -1,0 +1,23 @@
+{
+  "name": "local-srp-auth",
+  "version": "0.1.0",
+  "description": "Zero-dependency SRP-6a authentication: passwords never leave the browser in any form, TOTP MFA with recovery codes, pluggable storage, renameable usernames/roles via stable IDs.",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "files": [
+    "src"
+  ]
+}

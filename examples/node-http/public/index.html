@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>local-srp-auth demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 2rem auto; padding: 0 1rem; }
+  fieldset { margin-bottom: 1.5rem; }
+  label { display: block; margin-top: 0.5rem; }
+  input { width: 100%; box-sizing: border-box; padding: 0.4rem; margin-top: 0.2rem; }
+  button { margin-top: 0.75rem; padding: 0.5rem 1rem; }
+  pre { background: #f0f0f0; padding: 0.75rem; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+  .error { color: #b00020; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<h1>local-srp-auth demo</h1>
+<p>This page never sends a password anywhere — only one-time SRP protocol
+values. Open your network tab and check for yourself.</p>
+
+<section id="bootstrap-section" class="hidden">
+  <h2>First-run setup</h2>
+  <p>No account exists yet. Paste the setup token printed in the server's console.</p>
+  <fieldset>
+    <label>Setup token <input id="bootstrap-token"></label>
+    <label>Username <input id="bootstrap-username" value="admin"></label>
+    <label>Password <input id="bootstrap-password" type="password"></label>
+    <button id="bootstrap-submit">Create admin account</button>
+  </fieldset>
+</section>
+
+<section id="auth-section" class="hidden">
+  <h2>Register</h2>
+  <fieldset>
+    <label>Username <input id="register-username"></label>
+    <label>Password <input id="register-password" type="password"></label>
+    <button id="register-submit">Register</button>
+  </fieldset>
+
+  <h2>Log in</h2>
+  <fieldset>
+    <label>Username <input id="login-username"></label>
+    <label>Password <input id="login-password" type="password"></label>
+    <button id="login-submit">Log in</button>
+  </fieldset>
+
+  <fieldset id="mfa-fieldset" class="hidden">
+    <legend>MFA required</legend>
+    <label>Code from authenticator app (or a recovery code) <input id="mfa-code"></label>
+    <button id="mfa-submit">Verify</button>
+  </fieldset>
+</section>
+
+<section id="session-section" class="hidden">
+  <h2>Signed in</h2>
+  <pre id="session-info"></pre>
+
+  <fieldset id="enroll-fieldset">
+    <legend>Enable MFA</legend>
+    <button id="enroll-begin">Start enrollment</button>
+    <div id="enroll-details" class="hidden">
+      <p>Manual entry secret (or otpauth:// URI — feed it to any QR renderer):</p>
+      <pre id="enroll-secret"></pre>
+      <label>Code from your authenticator app <input id="enroll-code"></label>
+      <button id="enroll-confirm">Confirm</button>
+    </div>
+    <pre id="recovery-codes" class="hidden"></pre>
+  </fieldset>
+</section>
+
+<p id="status"></p>
+
+<script type="module">
+  import { SrpRegistration, SrpLoginAttempt, defaultWebCryptoAdapter } from '/lib/client/index.js'
+
+  const adapter = defaultWebCryptoAdapter()
+  const statusEl = document.getElementById('status')
+  let sessionToken = null
+  let pendingMfaToken = null
+
+  function setStatus (msg, isError = false) {
+    statusEl.textContent = msg
+    statusEl.className = isError ? 'error' : ''
+  }
+
+  async function api (path, body) {
+    const headers = { 'Content-Type': 'application/json' }
+    if (sessionToken) headers.Authorization = `Bearer ${sessionToken}`
+    const res = await fetch(path, { method: 'POST', headers, body: body ? JSON.stringify(body) : undefined })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.error || `request failed: ${path}`)
+    return data
+  }
+
+  async function refreshTopLevelView () {
+    const { needsBootstrap } = await api('/api/bootstrap/status')
+    document.getElementById('bootstrap-section').classList.toggle('hidden', !needsBootstrap)
+    document.getElementById('auth-section').classList.toggle('hidden', needsBootstrap)
+  }
+
+  document.getElementById('bootstrap-submit').addEventListener('click', async () => {
+    try {
+      const password = document.getElementById('bootstrap-password').value
+      const credential = await SrpRegistration.create({ password, adapter })
+      await api('/api/bootstrap/complete', {
+        token: document.getElementById('bootstrap-token').value,
+        username: document.getElementById('bootstrap-username').value,
+        ...credential
+      })
+      setStatus('Admin account created. You can now log in.')
+      await refreshTopLevelView()
+    } catch (err) {
+      setStatus(err.message, true)
+    }
+  })
+
+  document.getElementById('register-submit').addEventListener('click', async () => {
+    try {
+      const password = document.getElementById('register-password').value
+      const credential = await SrpRegistration.create({ password, adapter })
+      await api('/api/register', { username: document.getElementById('register-username').value, ...credential })
+      setStatus('Registered. You can now log in.')
+    } catch (err) {
+      setStatus(err.message, true)
+    }
+  })
+
+  document.getElementById('login-submit').addEventListener('click', async () => {
+    try {
+      const username = document.getElementById('login-username').value
+      const password = document.getElementById('login-password').value
+
+      const client = new SrpLoginAttempt({ adapter })
+      const { A } = client.start()
+      const { challengeId, salt, B, uid } = await api('/api/login/begin', { username, clientPublicEphemeral: A })
+      const { M1 } = await client.finish({ password, salt, serverPublicEphemeral: B, uid })
+      const result = await api('/api/login/complete', { challengeId, clientProof: M1 })
+      await client.verifyServerProof(result.M2) // throws if the server can't prove it knows K too
+
+      if (result.mfaRequired) {
+        pendingMfaToken = result.mfaToken
+        document.getElementById('mfa-fieldset').classList.remove('hidden')
+        setStatus('Password verified. Enter your MFA code.')
+      } else {
+        sessionToken = result.sessionToken
+        setStatus('Logged in.')
+        await showSession()
+      }
+    } catch (err) {
+      setStatus(err.message, true)
+    }
+  })
+
+  document.getElementById('mfa-submit').addEventListener('click', async () => {
+    try {
+      const code = document.getElementById('mfa-code').value
+      let result
+      try {
+        result = await api('/api/mfa/totp/verify', { mfaToken: pendingMfaToken, code })
+      } catch {
+        result = await api('/api/mfa/recovery/verify', { mfaToken: pendingMfaToken, recoveryCode: code })
+      }
+      sessionToken = result.sessionToken
+      document.getElementById('mfa-fieldset').classList.add('hidden')
+      setStatus('Logged in.')
+      await showSession()
+    } catch (err) {
+      setStatus(err.message, true)
+    }
+  })
+
+  async function showSession () {
+    const me = await api('/api/me')
+    document.getElementById('auth-section').classList.add('hidden')
+    document.getElementById('session-section').classList.remove('hidden')
+    document.getElementById('session-info').textContent = JSON.stringify(me, null, 2)
+  }
+
+  document.getElementById('enroll-begin').addEventListener('click', async () => {
+    try {
+      const { pendingToken, secretBase32, otpauthUri } = await api('/api/mfa/enroll/begin')
+      document.getElementById('enroll-details').classList.remove('hidden')
+      document.getElementById('enroll-secret').textContent = `${secretBase32}\n\n${otpauthUri}`
+      document.getElementById('enroll-confirm').onclick = async () => {
+        const code = document.getElementById('enroll-code').value
+        const { recoveryCodes } = await api('/api/mfa/enroll/confirm', { pendingToken, code })
+        const el = document.getElementById('recovery-codes')
+        el.classList.remove('hidden')
+        el.textContent = 'Save these recovery codes now — they will not be shown again:\n\n' + recoveryCodes.join('\n')
+      }
+    } catch (err) {
+      setStatus(err.message, true)
+    }
+  })
+
+  refreshTopLevelView().catch((err) => setStatus(err.message, true))
+</script>
+</body>
+</html>
