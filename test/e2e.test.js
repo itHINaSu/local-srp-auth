@@ -293,6 +293,34 @@ test('changeUsername renames the account and rejects a collision', async () => {
   )
 })
 
+// Regression test: every bucket _enforceRateLimit() can reach needs a
+// config entry in DEFAULT_RATE_LIMITS, *and* its 'Client' counterpart,
+// since a truthy clientKey (an IP, in a real deployment — always present)
+// makes _enforceRateLimit() consume both. Every method below was written
+// with a clientKey in these tests specifically to exercise that second,
+// easy-to-forget bucket — the rest of this file's other tests mostly
+// don't pass one, which is exactly how a missing '*Client' entry (a real
+// bug caught manually, not by the suite) went unnoticed before this test
+// was added.
+test('every new self-service method works with a clientKey supplied (exercises the *Client rate-limit bucket too)', async () => {
+  const server = makeServer({ passwordResetEnabled: true, passwordResetSender: async () => {} })
+  await register(server, 'alice', 'old-password')
+  const alice = await server.userStore.getUserByUsername('alice')
+
+  await server.changeUsername({ uid: alice.id, newUsername: 'alice2', clientKey: '127.0.0.1' })
+
+  const client = new SrpLoginAttempt({ adapter: clientAdapter })
+  const { A } = client.start()
+  const begin = await server.beginPasswordChange({ uid: alice.id, clientPublicEphemeral: A, clientKey: '127.0.0.1' })
+  const { M1 } = await client.finish({ password: 'old-password', salt: begin.salt, serverPublicEphemeral: begin.B, uid: begin.uid })
+  const newCredential = await SrpRegistration.create({ password: 'new-password', adapter: clientAdapter })
+  await server.completePasswordChange({ uid: alice.id, challengeId: begin.challengeId, clientProof: M1, ...asNewCredential(newCredential), clientKey: '127.0.0.1' })
+
+  await server.requestPasswordReset({ username: 'alice2', clientKey: '127.0.0.1' })
+
+  await server.setUserRoles({ uid: alice.id, roleIds: [], clientKey: '127.0.0.1' })
+})
+
 test('password change requires proving the current password, then the new password logs in', async () => {
   const server = makeServer()
   await register(server, 'alice', 'old-password')

@@ -55,7 +55,8 @@ const DEFAULT_RATE_LIMITS = {
   // Not a credential-guessing surface, but still capped against abuse
   // (hammering the uniqueness check, log spam) — much more generous than
   // the credential buckets above since there's nothing to guess here.
-  usernameChange: { maxAttempts: 20, windowMs: 60 * 60 * 1000 }
+  usernameChange: { maxAttempts: 20, windowMs: 60 * 60 * 1000 },
+  usernameChangeClient: { maxAttempts: 40, windowMs: 60 * 60 * 1000 }
 }
 
 class AuthServer {
