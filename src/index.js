@@ -13,6 +13,15 @@ import * as recoveryCodes from './totp/recovery-codes.js'
 import { UserStore, RoleStore, ChallengeStore, SessionStore } from './storage/storage-interface.js'
 import { MemoryUserStore, MemoryRoleStore, MemoryChallengeStore, MemorySessionStore } from './storage/memory-store.js'
 import { JsonFileUserStore, JsonFileRoleStore } from './storage/json-file-store.js'
+import { RateLimiter, RateLimitExceededError } from './rate-limit/rate-limiter.js'
+import { MemoryRateLimiter } from './rate-limit/memory-rate-limiter.js'
+import { AuditLogger, ConsoleAuditLogger, NullAuditLogger } from './audit/audit-logger.js'
+import { ShippingAuditLogger } from './audit/shipping-audit-logger.js'
+import { LogShipper } from './audit/shippers/log-shipper.js'
+import { TftpLogShipper } from './audit/shippers/tftp-log-shipper.js'
+import { FtpLogShipper } from './audit/shippers/ftp-log-shipper.js'
+import { ScpLogShipper } from './audit/shippers/scp-log-shipper.js'
+import * as sessionTransport from './session-transport.js'
 
 const storage = {
   UserStore,
@@ -27,6 +36,23 @@ const storage = {
   JsonFileRoleStore
 }
 
+const rateLimit = {
+  RateLimiter,
+  RateLimitExceededError,
+  MemoryRateLimiter
+}
+
+const audit = {
+  AuditLogger,
+  ConsoleAuditLogger,
+  NullAuditLogger,
+  ShippingAuditLogger,
+  LogShipper,
+  TftpLogShipper,
+  FtpLogShipper,
+  ScpLogShipper
+}
+
 export {
   AuthServer,
   publicUser,
@@ -37,5 +63,8 @@ export {
   totp,
   base32,
   recoveryCodes,
-  storage
+  storage,
+  rateLimit,
+  audit,
+  sessionTransport
 }

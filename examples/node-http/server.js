@@ -1,8 +1,9 @@
 // Minimal end-to-end example: plain node:http (no framework, no
 // dependencies) wiring AuthServer to a JSON-file store. Demonstrates the
 // full request shape an integration needs: bootstrap, register, login
-// (2 round trips), TOTP enrollment + verification, recovery codes, and
-// session-gated routes.
+// (2 round trips), TOTP enrollment + verification, recovery codes,
+// logout, cookie-based session transport with CSRF protection,
+// client-IP-aware rate limiting, and audit logging.
 //
 // Run: node examples/node-http/server.js
 // Then open http://localhost:8787 in a browser.
@@ -15,10 +16,29 @@ import { fileURLToPath } from 'node:url'
 import { AuthServer } from '../../src/server-auth.js'
 import { Bootstrap } from '../../src/bootstrap.js'
 import { JsonFileUserStore, JsonFileRoleStore } from '../../src/storage/json-file-store.js'
+import { RateLimitExceededError } from '../../src/rate-limit/rate-limiter.js'
+import {
+  setSessionCookie, clearSessionCookie, getSessionToken,
+  generateCsrfToken, setCsrfCookie, verifyCsrfToken
+} from '../../src/session-transport.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = path.join(__dirname, 'data')
 const PORT = process.env.PORT || 8787
+
+// This demo runs over plain HTTP (no TLS termination here), so the
+// session cookie is set with secure:false — see session-transport.js's
+// module comment for what that tradeoff means. A production deployment
+// behind TLS should not set this.
+const COOKIE_SECURE = false
+
+// Audit log shipping is off by default in this demo (no destination
+// configured). To try it against a real TFTP/FTP/SCP log server:
+//   import { ShippingAuditLogger } from '../../src/audit/shipping-audit-logger.js'
+//   import { TftpLogShipper } from '../../src/audit/shippers/tftp-log-shipper.js'
+//   const logger = new ShippingAuditLogger({ shippers: [new TftpLogShipper({ host: '10.0.0.5' })] })
+//   logger.start()
+//   // then pass `logger` into the AuthServer constructor below.
 
 const server = new AuthServer({
   userStore: new JsonFileUserStore(path.join(DATA_DIR, 'users.json')),
@@ -39,51 +59,101 @@ async function printBootstrapTokenIfNeeded () {
 }
 await printBootstrapTokenIfNeeded()
 
+function clientKeyOf (req) {
+  return req.socket.remoteAddress
+}
+
+/** Establishes an authenticated session: sets the session cookie and a fresh CSRF cookie. */
+function startAuthenticatedSession (res, sessionToken) {
+  setSessionCookie(res, sessionToken, { secure: COOKIE_SECURE })
+  setCsrfCookie(res, generateCsrfToken(), { secure: COOKIE_SECURE })
+}
+
+async function requireSession (req) {
+  const token = getSessionToken(req)
+  const session = token && (await server.getSession(token))
+  if (!session) throw httpError(401, 'not authenticated')
+  return session
+}
+
+/** CSRF check for state-changing requests made by an already-authenticated browser. */
+function requireCsrf (req) {
+  if (!verifyCsrfToken(req)) throw httpError(403, 'CSRF check failed')
+}
+
+function httpError (statusCode, message) {
+  const err = new Error(message)
+  err.statusCode = statusCode
+  return err
+}
+
 const routes = {
   'POST /api/bootstrap/status': async () => ({ needsBootstrap: await bootstrap.needsBootstrap() }),
 
-  'POST /api/bootstrap/complete': async (body) => {
-    const user = await bootstrap.completeBootstrap(body)
+  'POST /api/bootstrap/complete': async (body, req) => {
+    const user = await bootstrap.completeBootstrap({ ...body, clientKey: clientKeyOf(req) })
     return { user }
   },
 
-  'POST /api/register': async (body) => {
-    const user = await server.registerUser({ ...body, roleIds: ['role-privileged-1'] })
+  'POST /api/register': async (body, req) => {
+    const user = await server.registerUser({ ...body, roleIds: ['role-privileged-1'], clientKey: clientKeyOf(req) })
     return { user }
   },
 
-  'POST /api/login/begin': async (body) => server.beginLogin(body),
+  'POST /api/login/begin': async (body, req) => server.beginLogin({ ...body, clientKey: clientKeyOf(req) }),
 
-  'POST /api/login/complete': async (body) => server.completeLogin(body),
+  'POST /api/login/complete': async (body, req, res) => {
+    const result = await server.completeLogin(body)
+    if (!result.mfaRequired) startAuthenticatedSession(res, result.sessionToken)
+    // The raw sessionToken never needs to reach the browser's JS at all —
+    // it's already in the (HttpOnly) cookie by the time this responds.
+    const { sessionToken, ...rest } = result
+    return rest
+  },
 
-  'POST /api/mfa/totp/verify': async (body) => server.verifyMfaTotp(body),
+  'POST /api/mfa/totp/verify': async (body, req, res) => {
+    const result = await server.verifyMfaTotp({ ...body, clientKey: clientKeyOf(req) })
+    startAuthenticatedSession(res, result.sessionToken)
+    return {}
+  },
 
-  'POST /api/mfa/recovery/verify': async (body) => server.verifyMfaRecoveryCode(body),
+  'POST /api/mfa/recovery/verify': async (body, req, res) => {
+    const result = await server.verifyMfaRecoveryCode({ ...body, clientKey: clientKeyOf(req) })
+    startAuthenticatedSession(res, result.sessionToken)
+    return { recoveryCodesRemaining: result.recoveryCodesRemaining }
+  },
 
   'POST /api/mfa/enroll/begin': async (body, req) => {
     const session = await requireSession(req)
+    requireCsrf(req)
     return server.beginTotpEnrollment(session.uid)
   },
 
-  'POST /api/mfa/enroll/confirm': async (body) => server.confirmTotpEnrollment(body),
+  'POST /api/mfa/enroll/confirm': async (body, req) => {
+    await requireSession(req)
+    requireCsrf(req)
+    return server.confirmTotpEnrollment({ ...body, clientKey: clientKeyOf(req) })
+  },
+
+  'POST /api/mfa/disable': async (body, req) => {
+    const session = await requireSession(req)
+    requireCsrf(req)
+    await server.disableTotp({ uid: session.uid, code: body.code, clientKey: clientKeyOf(req) })
+    return {}
+  },
+
+  'POST /api/logout': async (body, req, res) => {
+    const token = getSessionToken(req)
+    if (token) await server.destroySession(token)
+    clearSessionCookie(res, { secure: COOKIE_SECURE })
+    return {}
+  },
 
   'POST /api/me': async (body, req) => {
     const session = await requireSession(req)
     const user = await server.userStore.getUserById(session.uid)
     return { username: user.username, roleIds: user.roleIds, mfaEnabled: Boolean(user.totp) }
   }
-}
-
-async function requireSession (req) {
-  const auth = req.headers.authorization || ''
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null
-  const session = token && (await server.getSession(token))
-  if (!session) {
-    const err = new Error('not authenticated')
-    err.statusCode = 401
-    throw err
-  }
-  return session
 }
 
 const STATIC_DIR = path.join(__dirname, 'public')
@@ -97,10 +167,15 @@ const httpServer = http.createServer(async (req, res) => {
   if (routes[routeKey]) {
     try {
       const body = req.method === 'POST' ? await readJsonBody(req) : null
-      const result = await routes[routeKey](body, req)
+      const result = await routes[routeKey](body, req, res)
       sendJson(res, 200, result ?? {})
     } catch (err) {
-      sendJson(res, err.statusCode || 400, { error: err.message })
+      if (err instanceof RateLimitExceededError) {
+        res.setHeader('Retry-After', Math.ceil(err.retryAfterMs / 1000))
+        sendJson(res, 429, { error: 'too many attempts, try again later' })
+      } else {
+        sendJson(res, err.statusCode || 400, { error: err.message })
+      }
     }
     return
   }

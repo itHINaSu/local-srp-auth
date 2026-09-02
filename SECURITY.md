@@ -16,10 +16,12 @@ integrator, and where the cryptographic choices came from.
 | Renaming a user or a role breaks their credential/permissions | Yes | Usernames and role names are display-only; every crypto and permission check keys off a stable `id` that renaming never touches (tested explicitly — see `test/e2e.test.js` and `test/roles.test.js`). |
 | Username enumeration via login attempts | Yes | `beginLogin()` returns a deterministic, indistinguishable-in-shape fake `(uid, salt, verifier)` for a nonexistent username (HMAC-derived from a per-process secret), so response shape and cost are the same either way. |
 | Client trusting a forged TOTP/recovery bypass | Yes | MFA verification happens entirely server-side against the stored secret/hashes; the client never sees or influences the comparison. |
-| Brute-forcing login attempts / credential stuffing | **No** — integrator's responsibility | This package does not rate-limit or lock out repeated attempts. Add this at your reverse proxy, framework middleware, or `ChallengeStore`/`SessionStore` layer — the right limits are deployment-specific (traffic patterns, existing WAF, etc.), and a wrong guess here would be worse than no guess. |
-| CSRF / session-token theft via XSS | **No** — integrator's responsibility | This package issues an opaque session token string and validates it via `getSession()`. It does not choose cookie vs. header transport, `httpOnly`/`SameSite` flags, or CSRF tokens — those are framework- and deployment-specific decisions. |
-| Multi-instance / distributed deployment consistency | Partially | `JsonFileUserStore`/`JsonFileRoleStore` are safe for one process (atomic write + in-process write queue) but not for multiple instances writing the same file. `ChallengeStore`/`SessionStore` default to in-memory (lost on restart, not shared across instances) — pass your own Redis-backed (or similar) implementation of those interfaces for a real multi-instance deployment. |
-| Timing side channels | Best-effort | Recovery-code and TOTP-secret comparisons use `crypto.timingSafeEqual`. Enumeration resistance (above) addresses the main username-existence timing channel. PBKDF2/modexp costs are inherently data-independent in Node's/the browser's implementations; this package does not add its own variable-time comparisons on secret material. |
+| Brute-forcing login attempts / credential stuffing | Yes, baseline | Login, MFA verification, registration, and bootstrap are all rate-limited by default (`src/rate-limit/`) — keyed by username/uid out of the box (works with zero wiring, and can't be used to enumerate accounts — see below), with an optional additional per-client-key layer (an IP, typically) for callers that supply one. Defaults are conservative starting points (`DEFAULT_RATE_LIMITS` in `server-auth.js`), fully overridable via the `rateLimits` constructor option. The default `MemoryRateLimiter` is per-process — see "Multi-instance" below. |
+| CSRF / session-token theft via XSS | Yes, if you use the shipped helpers | `src/session-transport.js` provides HttpOnly session cookies (JS can't read them, so XSS can't exfiltrate them directly) plus double-submit CSRF cookie/header verification. `AuthServer` itself still only deals in an opaque token string — these helpers are opt-in but ready to use, see `examples/node-http/server.js` for the full wiring. |
+| Multi-instance / distributed deployment consistency | Partially | `JsonFileUserStore`/`JsonFileRoleStore` are safe for one process (atomic write + in-process write queue) but not for multiple instances writing the same file. `ChallengeStore`/`SessionStore`/`MemoryRateLimiter` default to in-memory (lost on restart, not shared across instances) — pass your own Redis-backed (or similar) implementation of those interfaces for a real multi-instance deployment. |
+| Timing side channels | Best-effort | Recovery-code, TOTP-secret, CSRF-token, and SRP proof (M1/M2) comparisons all use `crypto.timingSafeEqual` or an equivalent constant-time byte comparison — see the comments in `srp-server.js`/`srp-client.js` and `session-transport.js`. Enumeration resistance (above) addresses the main username-existence timing channel. PBKDF2/modexp costs are inherently data-independent in Node's/the browser's implementations; this package does not add its own variable-time comparisons on secret material. |
+| Attacker deliberately locking a real user out via rate limiting | **Partially — an inherent tradeoff, not a bug** | Because the login rate limit is keyed by the *submitted username string* (required for enumeration resistance, above), an attacker who knows a real username can exhaust that username's budget with wrong-password attempts, denying the real user login for the rest of the window. This is the standard tradeoff every username-keyed rate limiter makes; mitigations (CAPTCHA after N failures, a per-account "notify + allow" exception path, etc.) are application-UX decisions this package doesn't make for you. The per-client-key layer (when a caller supplies one) doesn't have this problem, since an attacker doesn't control the *victim's* IP — but it's optional. |
+| Audit log server compromise or tampering | Partially | Shipped log batches are plain newline-delimited JSON with no integrity signing — a compromised or malicious log server sees genuine plaintext audit data (see the log-shipping section below for what each transport does/doesn't encrypt) but can't feed anything back into `AuthServer`; log shipping is one-directional and `ShippingAuditLogger` never trusts a response from a shipper beyond "did `ship()` throw." Local logging (`localLogger`) is unaffected regardless of what happens on the wire. |
 
 ## Cryptographic choices, and why
 
@@ -73,23 +75,63 @@ integrator, and where the cryptographic choices came from.
   update — everything this package does, it does with what Node and the
   browser already ship.
 
+## Audit log shipping
+
+`ShippingAuditLogger` (`src/audit/shipping-audit-logger.js`) queues
+events and, on a timer, hands batches to one or more `LogShipper`
+destinations. Local logging (via `localLogger`, `ConsoleAuditLogger` by
+default) always happens synchronously with the auth flow regardless of
+shipping outcome — an unreachable or slow log server delays shipping or
+drops the oldest queued entries once `maxQueueSize` is hit (logged
+locally when it happens), it never blocks or breaks logins. Three
+shippers ship in the box:
+
+- **TFTP** (`TftpLogShipper`) — pure Node `dgram`, RFC 1350, no
+  dependency. TFTP has **no authentication and no encryption**; anyone
+  who can reach the server on UDP/69 can write arbitrary files to it.
+  That's inherent to the protocol, not this implementation — appropriate
+  only for a trusted, isolated management network (this project's own
+  domain, network/cell-site equipment provisioning, is a canonical
+  example of where that's still normal practice), never the open
+  internet.
+- **FTP** (`FtpLogShipper`) — pure Node `net`, enough of RFC 959 to log
+  in, go passive, and `STOR` one file per flush. No dependency, but also
+  **no FTPS/TLS support** — credentials and data travel in the clear,
+  same caveat as TFTP. If you need an encrypted transport, use SCP
+  instead, or implement `LogShipper` yourself against a TLS-capable
+  library.
+- **SCP** (`ScpLogShipper`) — shells out to the system's `scp` binary via
+  `execFile` (array arguments only, never a shell string — a batch's
+  content or a crafted file name cannot be interpreted as a shell
+  command; see `test/log-shippers.test.js` for a test that deliberately
+  tries). This package does **not** implement SSH itself — doing so would
+  mean hand-rolling exactly the kind of cryptographic transport protocol
+  this document's "no hand-rolled cryptographic primitives" rule exists
+  to prevent. Consequences worth knowing: `scp` must be installed and on
+  `PATH`; auth must be key-based and passwordless (an SSH agent or an
+  unencrypted identity file — there's no safe non-interactive way to
+  hand `scp` a password); and the destination's host key must already be
+  trusted (in the invoking user's `known_hosts`) unless you explicitly
+  set `allowUnknownHostKey: true`, which disables host-key verification
+  and accepts the real MITM risk that implies — off by default,
+  deliberately not the path of least resistance.
+
 ## Known limitations (by design, not oversight)
 
-- **No rate limiting or account lockout.** See the threat table above —
-  this is intentionally left to the deployment layer.
-- **No session-transport opinion.** This package returns an opaque
-  session token string; how it travels (cookie, header, storage) and
-  what CSRF protection wraps it is the integrator's decision.
-- **No audit logging.** Login attempts, MFA events, and admin actions
-  are not logged by this package. Add logging at the call sites in your
-  own route handlers if you need it.
 - **`JsonFileUserStore`/`JsonFileRoleStore` are single-instance.** Fine
   for a small deployment; write a database-backed `UserStore`/`RoleStore`
   for anything that needs to scale horizontally.
-- **Default `ChallengeStore`/`SessionStore` are in-memory.** Server
-  restarts drop in-flight logins and active sessions. Pass your own
-  implementation (Redis, a database, etc.) if that's not acceptable for
-  your deployment.
+- **Default `ChallengeStore`/`SessionStore`/`RateLimiter` are in-memory.**
+  Server restarts drop in-flight logins, active sessions, and rate-limit
+  counters; multiple instances behind a load balancer each enforce their
+  own independent limits rather than a shared one. Pass your own
+  implementation (Redis, a database, etc.) of the relevant interface if
+  that's not acceptable for your deployment.
+- **No account-lockout escape hatch beyond the rate-limit window
+  expiring.** There's no admin "unlock this account now" API, no
+  CAPTCHA-after-N-failures step-up, and no email-the-user-a-notice flow
+  — see the "attacker deliberately locking a real user out" threat-table
+  row above. These are UX/product decisions, not protocol gaps.
 - **TOTP secrets are stored in plaintext hex** in whatever `UserStore`
   backend you use (same trust boundary as the verifier — if your
   database is compromised, TOTP secrets are readable). Encrypting

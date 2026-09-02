@@ -48,6 +48,22 @@ See `SECURITY.md` for the full protocol and threat-model writeup.
   database.
 - **First-run bootstrap** (`src/bootstrap.js`) — if no user exists yet,
   a one-time setup token gates creating the first (admin) account.
+- **Rate limiting** (`src/rate-limit/`) — every credential-guessing entry
+  point (login, MFA verification, registration, bootstrap) is
+  rate-limited by default, keyed by username/uid (works with zero
+  wiring) with an optional extra layer keyed by a caller-supplied client
+  key (an IP, typically) for callers that want it.
+- **Session transport** (`src/session-transport.js`) — ready-to-use
+  HttpOnly cookie + double-submit CSRF helpers for plain `node:http` (or
+  anything with a similar req/res shape). `AuthServer` itself still only
+  deals in opaque session-token strings, so this stays optional.
+- **Audit logging** (`src/audit/`) — every security-relevant event
+  (registration, login success/failure, MFA enroll/verify/disable,
+  recovery-code use, session destroy, bootstrap, rate-limit trips) is
+  logged, with secrets (passwords, verifiers, TOTP secrets, raw
+  tokens/codes) never included — see `SECURITY.md`. Optionally ships
+  batches to a remote log server over TFTP, FTP, or SCP
+  (`src/audit/shippers/`).
 - **Zero runtime dependencies.** Every crypto primitive is a browser
   (`crypto.subtle`) or Node (`node:crypto`) built-in — nothing here is a
   hand-rolled cipher or hash implementation.
@@ -84,14 +100,17 @@ if (await bootstrap.needsBootstrap()) {
   console.log('Setup token:', token) // surface this however your deployment expects
 }
 
-// Wire these into your own HTTP framework's routes:
-server.registerUser({ username, salt, verifier, iterations, group })
-server.beginLogin({ username, clientPublicEphemeral })
+// Wire these into your own HTTP framework's routes. `clientKey` (e.g.
+// the request's IP) is optional everywhere it's accepted — omitting it
+// still rate-limits by username/uid, it just skips the extra per-source layer.
+server.registerUser({ username, salt, verifier, iterations, group, clientKey })
+server.beginLogin({ username, clientPublicEphemeral, clientKey })
 server.completeLogin({ challengeId, clientProof })
-server.verifyMfaTotp({ mfaToken, code })
+server.verifyMfaTotp({ mfaToken, code, clientKey })
 server.beginTotpEnrollment(uid)
-server.confirmTotpEnrollment({ pendingToken, code })
+server.confirmTotpEnrollment({ pendingToken, code, clientKey })
 server.getSession(sessionToken)
+server.destroySession(sessionToken)
 ```
 
 `AuthServer` never sees a password — only what the browser already
@@ -141,11 +160,18 @@ protocol value.
    require an HTTP(S) origin — they will not resolve from a bare
    `file://` URL, the same constraint CellSiteConfigGenerator's own
    README documents for its playbook loading mechanism.
-5. Design your own session-token transport (cookie vs. `Authorization`
-   header, CSRF handling, etc.) — this package issues an opaque session
-   token and validates it via `getSession()`, but deliberately does not
-   prescribe how it travels between browser and server; that's a
-   framework-specific decision this package shouldn't make for you.
+5. Wire up `src/session-transport.js`'s cookie helpers (see
+   `examples/node-http/server.js` for the full pattern: set the session
+   + CSRF cookies on login success, check the CSRF header on
+   state-changing authenticated routes, clear on logout). If your
+   deployment has no TLS, pass `secure: false` — see that file's module
+   comment for what that tradeoff means; leaving the default `true` on a
+   non-TLS deployment means the browser will silently refuse to store
+   the cookie at all, not just send it insecurely.
+6. If you want a remote audit trail, wrap your logger with
+   `ShippingAuditLogger` and pass it one or more shippers (see "Audit log
+   shipping" below). Optional — the default `ConsoleAuditLogger` needs no
+   configuration.
 
 ## Testing
 
@@ -167,14 +193,45 @@ citing RFC 5054 directly, the other RFC 3526) and cross-checked
 byte-for-byte programmatically before being committed — see the comment
 at the top of `src/common/groups.js`.
 
+## Audit log shipping
+
+`ShippingAuditLogger` wraps a local logger (`ConsoleAuditLogger` by
+default) and, on a timer, batches queued events out to one or more
+`LogShipper` destinations:
+
+```js
+import { AuthServer, audit } from 'local-srp-auth'
+
+const logger = new audit.ShippingAuditLogger({
+  shippers: [
+    new audit.TftpLogShipper({ host: '10.0.0.5' }),        // pure Node dgram, no dependency
+    // new audit.FtpLogShipper({ host: '...', user: '...', password: '...', remoteDir: '/logs' }),
+    // new audit.ScpLogShipper({ host: '...', user: '...', remoteDir: '/logs', identityFile: '~/.ssh/id_ed25519' }),
+  ]
+})
+logger.start() // begins the periodic flush; no-op if shippers is empty
+
+const server = new AuthServer({ userStore, roleStore, logger })
+```
+
+Local logging always happens synchronously with the auth flow; shipping
+never does — a slow or unreachable log server delays shipping or drops
+the oldest queued entries once a bound is hit, it never blocks or breaks
+logins. See `SECURITY.md`'s "Audit log shipping" section for what each
+transport does and doesn't protect (TFTP and plain FTP are unencrypted
+and unauthenticated by protocol design — appropriate for a trusted
+management network, not the open internet; SCP shells out to the
+system's `ssh`/`scp` binaries rather than reimplementing SSH, and
+requires key-based, passwordless auth already configured on the host).
+
 ## What this package deliberately does not do
 
-See `SECURITY.md` for the full list, but briefly: no rate limiting or
-account lockout (add this at your reverse proxy or framework layer — it
-is inherently deployment-specific), no CSRF protection or session
-transport (you choose cookies vs. headers), no audit logging, and the
-JSON-file storage backend is single-instance only (no distributed
-locking). None of these are protocol weaknesses — they're deployment
+See `SECURITY.md` for the full list, but briefly: account lockout
+beyond rate limiting (a human-in-the-loop unlock flow is
+application-specific), and the JSON-file storage backend is
+single-instance only (no distributed locking — write your own
+`UserStore`/`RoleStore` against a real database for a multi-instance
+deployment). Neither is a protocol weakness — they're deployment
 concerns this package leaves to the integrator rather than guessing
 wrong about your infrastructure.
 

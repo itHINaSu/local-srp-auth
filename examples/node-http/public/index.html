@@ -54,7 +54,10 @@ values. Open your network tab and check for yourself.</p>
 
 <section id="session-section" class="hidden">
   <h2>Signed in</h2>
+  <p>Session lives in an HttpOnly cookie — this page's JS never sees the
+  token itself, only the response of <code>/api/me</code>.</p>
   <pre id="session-info"></pre>
+  <button id="logout-submit">Log out</button>
 
   <fieldset id="enroll-fieldset">
     <legend>Enable MFA</legend>
@@ -76,7 +79,6 @@ values. Open your network tab and check for yourself.</p>
 
   const adapter = defaultWebCryptoAdapter()
   const statusEl = document.getElementById('status')
-  let sessionToken = null
   let pendingMfaToken = null
 
   function setStatus (msg, isError = false) {
@@ -84,12 +86,26 @@ values. Open your network tab and check for yourself.</p>
     statusEl.className = isError ? 'error' : ''
   }
 
+  function readCookie (name) {
+    const match = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]*)`))
+    return match ? decodeURIComponent(match[1]) : null
+  }
+
   async function api (path, body) {
+    // The session cookie rides along automatically (same-origin fetch);
+    // the CSRF cookie is deliberately NOT HttpOnly so this page's own JS
+    // can read it and echo it back — see session-transport.js for why
+    // that proves the request came from this page's JS, not another site.
     const headers = { 'Content-Type': 'application/json' }
-    if (sessionToken) headers.Authorization = `Bearer ${sessionToken}`
+    const csrfToken = readCookie('csrf')
+    if (csrfToken) headers['x-csrf-token'] = csrfToken
     const res = await fetch(path, { method: 'POST', headers, body: body ? JSON.stringify(body) : undefined })
     const data = await res.json()
-    if (!res.ok) throw new Error(data.error || `request failed: ${path}`)
+    if (!res.ok) {
+      const err = new Error(data.error || `request failed: ${path}`)
+      err.retryAfter = res.headers.get('Retry-After')
+      throw err
+    }
     return data
   }
 
@@ -143,28 +159,36 @@ values. Open your network tab and check for yourself.</p>
         document.getElementById('mfa-fieldset').classList.remove('hidden')
         setStatus('Password verified. Enter your MFA code.')
       } else {
-        sessionToken = result.sessionToken
         setStatus('Logged in.')
         await showSession()
       }
     } catch (err) {
-      setStatus(err.message, true)
+      setStatus(err.retryAfter ? `${err.message} (retry after ${err.retryAfter}s)` : err.message, true)
     }
   })
 
   document.getElementById('mfa-submit').addEventListener('click', async () => {
     try {
       const code = document.getElementById('mfa-code').value
-      let result
       try {
-        result = await api('/api/mfa/totp/verify', { mfaToken: pendingMfaToken, code })
+        await api('/api/mfa/totp/verify', { mfaToken: pendingMfaToken, code })
       } catch {
-        result = await api('/api/mfa/recovery/verify', { mfaToken: pendingMfaToken, recoveryCode: code })
+        await api('/api/mfa/recovery/verify', { mfaToken: pendingMfaToken, recoveryCode: code })
       }
-      sessionToken = result.sessionToken
       document.getElementById('mfa-fieldset').classList.add('hidden')
       setStatus('Logged in.')
       await showSession()
+    } catch (err) {
+      setStatus(err.message, true)
+    }
+  })
+
+  document.getElementById('logout-submit').addEventListener('click', async () => {
+    try {
+      await api('/api/logout')
+      setStatus('Logged out.')
+      document.getElementById('session-section').classList.add('hidden')
+      document.getElementById('auth-section').classList.remove('hidden')
     } catch (err) {
       setStatus(err.message, true)
     }

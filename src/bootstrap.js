@@ -54,8 +54,18 @@ class Bootstrap {
    * admin role) if, and only if, the token matches, hasn't expired, and
    * no user has been created since the token was issued (closes the
    * race between two concurrent bootstrap requests).
+   *
+   * Guessing a 32-byte (256-bit) token is already computationally
+   * infeasible on its own, but this is still rate-limited (reusing
+   * AuthServer's rateLimiter/logger) as defense in depth and for a
+   * consistent story: every credential-guessing entry point in this
+   * package is rate-limited and audited, no exceptions.
+   * @param {string} [opts.clientKey] e.g. the requester's IP
    */
-  async completeBootstrap ({ token, username, salt, verifier, iterations, group }) {
+  async completeBootstrap ({ token, username, salt, verifier, iterations, group, clientKey }) {
+    const server = this._authServer
+    await server._enforceRateLimit('bootstrap', 'setup', clientKey)
+
     if (!(await this.needsBootstrap())) {
       throw new Error('bootstrap already completed')
     }
@@ -63,16 +73,18 @@ class Bootstrap {
       throw new Error('no valid setup token — call generateSetupToken() again')
     }
     if (!constantTimeStringEqual(token, this._token)) {
+      await server._log('bootstrap.failed', { username, clientKey })
       throw new Error('invalid setup token')
     }
 
-    const user = await this._authServer.registerUser({
+    const user = await server.registerUser({
       username,
       salt,
       verifier,
       iterations,
       group,
-      roleIds: ['role-admin']
+      roleIds: ['role-admin'],
+      clientKey
     })
 
     // One-time: burn the token so a second request (even with the
@@ -80,6 +92,7 @@ class Bootstrap {
     this._token = null
     this._tokenExpiresAt = 0
 
+    await server._log('bootstrap.completed', { uid: user.id, username, clientKey })
     return user
   }
 }
