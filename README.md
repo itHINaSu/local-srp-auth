@@ -90,7 +90,12 @@ import { AuthServer, Bootstrap, storage } from 'local-srp-auth'
 
 const server = new AuthServer({
   userStore: new storage.JsonFileUserStore('./data/users.json'),
-  roleStore: new storage.JsonFileRoleStore('./data/roles.json')
+  roleStore: new storage.JsonFileRoleStore('./data/roles.json'),
+  // Optional — defaults to MemorySessionStore, which loses every logged-in
+  // session on a restart (including a routine `docker compose restart`,
+  // not just a crash). Pass this if you don't want a restart to force
+  // everyone to log back in.
+  sessionStore: new storage.JsonFileSessionStore('./data/sessions.json')
 })
 await server.ensureDefaultRoles()
 
