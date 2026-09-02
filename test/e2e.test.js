@@ -37,6 +37,32 @@ async function login (server, username, password) {
   return result
 }
 
+/** completePasswordReset() takes newSalt/newVerifier/newIterations/newGroup — SrpRegistration.create() returns salt/verifier/iterations/group. */
+function asNewCredential (cred) {
+  return { newSalt: cred.salt, newVerifier: cred.verifier, newIterations: cred.iterations, newGroup: cred.group }
+}
+
+/** Mirrors login()'s two-round-trip shape, but against beginPasswordChange()/completePasswordChange(). */
+async function changePassword (server, uid, currentPassword, newPassword, extra = {}) {
+  const client = new SrpLoginAttempt({ adapter: clientAdapter })
+  const { A } = client.start()
+  const begin = await server.beginPasswordChange({ uid, clientPublicEphemeral: A })
+  const { M1 } = await client.finish({ password: currentPassword, salt: begin.salt, serverPublicEphemeral: begin.B, uid: begin.uid })
+  const newCredential = await SrpRegistration.create({ password: newPassword, adapter: clientAdapter })
+  const result = await server.completePasswordChange({
+    uid,
+    challengeId: begin.challengeId,
+    clientProof: M1,
+    newSalt: newCredential.salt,
+    newVerifier: newCredential.verifier,
+    newIterations: newCredential.iterations,
+    newGroup: newCredential.group,
+    ...extra
+  })
+  await client.verifyServerProof(result.M2)
+  return result
+}
+
 test('bootstrap creates the first account as admin, and only once', async () => {
   const server = makeServer()
   await server.ensureDefaultRoles()
@@ -249,4 +275,177 @@ test('registering the same username twice fails', async () => {
   const server = makeServer()
   await register(server, 'alice', 'password-one')
   await assert.rejects(register(server, 'alice', 'password-two'), /username already taken/)
+})
+
+test('changeUsername renames the account and rejects a collision', async () => {
+  const server = makeServer()
+  await register(server, 'alice', 'x')
+  await register(server, 'bob', 'y')
+  const alice = await server.userStore.getUserByUsername('alice')
+
+  const renamed = await server.changeUsername({ uid: alice.id, newUsername: 'alice2' })
+  assert.equal(renamed.username, 'alice2')
+  assert.equal(await login(server, 'alice2', 'x').then((r) => r.mfaRequired), false)
+
+  await assert.rejects(
+    server.changeUsername({ uid: alice.id, newUsername: 'bob' }),
+    /username already taken/
+  )
+})
+
+test('password change requires proving the current password, then the new password logs in', async () => {
+  const server = makeServer()
+  await register(server, 'alice', 'old-password')
+  const alice = await server.userStore.getUserByUsername('alice')
+
+  await changePassword(server, alice.id, 'old-password', 'new-password')
+
+  await assert.rejects(login(server, 'alice', 'old-password'), /login failed/)
+  const result = await login(server, 'alice', 'new-password')
+  assert.equal(result.mfaRequired, false)
+})
+
+test('password change fails if the submitted proof does not match the current password', async () => {
+  const server = makeServer()
+  await register(server, 'alice', 'old-password')
+  const alice = await server.userStore.getUserByUsername('alice')
+
+  await assert.rejects(
+    changePassword(server, alice.id, 'WRONG-current-password', 'new-password'),
+    /password change failed/
+  )
+  // Old password must still work — the failed attempt must not have partially applied.
+  const result = await login(server, 'alice', 'old-password')
+  assert.equal(result.mfaRequired, false)
+})
+
+test('password change invalidates other sessions but keeps the one that made the change', async () => {
+  const server = makeServer()
+  await register(server, 'alice', 'old-password')
+  const alice = await server.userStore.getUserByUsername('alice')
+
+  const { sessionToken: otherDeviceSession } = await login(server, 'alice', 'old-password')
+  const { sessionToken: thisDeviceSession } = await login(server, 'alice', 'old-password')
+
+  await changePassword(server, alice.id, 'old-password', 'new-password', { keepSessionToken: thisDeviceSession })
+
+  assert.equal(await server.getSession(otherDeviceSession), null)
+  assert.notEqual(await server.getSession(thisDeviceSession), null)
+})
+
+test('password change on an MFA-enabled account requires a valid code', async () => {
+  const server = makeServer()
+  await register(server, 'alice', 'old-password')
+  const alice = await server.userStore.getUserByUsername('alice')
+
+  const enrollment = await server.beginTotpEnrollment(alice.id)
+  const secretFromUri = new URL(enrollment.otpauthUri).searchParams.get('secret')
+  const { decode } = await import('../src/totp/base32.js')
+  const secret = decode(secretFromUri)
+  await server.confirmTotpEnrollment({ pendingToken: enrollment.pendingToken, code: totp.totpAt(secret, Date.now()) })
+
+  await assert.rejects(
+    changePassword(server, alice.id, 'old-password', 'new-password', { mfaCode: '000000' }),
+    /password change failed/
+  )
+  // Still on the old password — the MFA-less attempt must not have applied.
+  assert.equal(await login(server, 'alice', 'old-password').then((r) => r.mfaRequired), true)
+
+  await changePassword(server, alice.id, 'old-password', 'new-password', { mfaCode: totp.totpAt(secret, Date.now()) })
+  assert.equal(await login(server, 'alice', 'new-password').then((r) => r.mfaRequired), true)
+})
+
+test('password reset is a no-op unless passwordResetEnabled, but always resolves the same way', async () => {
+  const server = makeServer() // passwordResetEnabled defaults false
+  await register(server, 'alice', 'old-password')
+
+  assert.deepEqual(await server.requestPasswordReset({ username: 'alice' }), { requested: true })
+  assert.deepEqual(await server.requestPasswordReset({ username: 'nobody' }), { requested: true })
+  await assert.rejects(
+    server.completePasswordReset({ token: 'anything', newSalt: 'x', newVerifier: 'y' }),
+    /password reset is not enabled/
+  )
+  // The old password must still work — nothing should have happened.
+  assert.equal(await login(server, 'alice', 'old-password').then((r) => r.mfaRequired), false)
+})
+
+test('password reset end to end when enabled: sender receives the token, completing it changes the password and is single-use', async () => {
+  const sent = []
+  const server = makeServer({
+    passwordResetEnabled: true,
+    passwordResetSender: async (ctx) => { sent.push(ctx) }
+  })
+  await register(server, 'alice', 'old-password')
+
+  await server.requestPasswordReset({ username: 'alice' })
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].user.username, 'alice')
+  const { token } = sent[0]
+
+  const newCredential = await SrpRegistration.create({ password: 'reset-password', adapter: clientAdapter })
+  await server.completePasswordReset({ token, ...asNewCredential(newCredential) })
+
+  await assert.rejects(login(server, 'alice', 'old-password'), /login failed/)
+  assert.equal(await login(server, 'alice', 'reset-password').then((r) => r.mfaRequired), false)
+
+  // Single-use: the same token can't be replayed.
+  const anotherCredential = await SrpRegistration.create({ password: 'third-password', adapter: clientAdapter })
+  await assert.rejects(
+    server.completePasswordReset({ token, ...asNewCredential(anotherCredential) }),
+    /reset link expired or invalid/
+  )
+})
+
+test('password reset on an MFA-enabled account requires a valid code, and does not leak whether MFA is on for unknown users', async () => {
+  const sent = []
+  const server = makeServer({
+    passwordResetEnabled: true,
+    passwordResetSender: async (ctx) => { sent.push(ctx) }
+  })
+  await register(server, 'alice', 'old-password')
+  const alice = await server.userStore.getUserByUsername('alice')
+  const enrollment = await server.beginTotpEnrollment(alice.id)
+  const secretFromUri = new URL(enrollment.otpauthUri).searchParams.get('secret')
+  const { decode } = await import('../src/totp/base32.js')
+  const secret = decode(secretFromUri)
+  await server.confirmTotpEnrollment({ pendingToken: enrollment.pendingToken, code: totp.totpAt(secret, Date.now()) })
+
+  await server.requestPasswordReset({ username: 'alice' })
+  const { token } = sent[0]
+  const newCredential = await SrpRegistration.create({ password: 'reset-password', adapter: clientAdapter })
+
+  await assert.rejects(
+    server.completePasswordReset({ token, ...asNewCredential(newCredential), mfaCode: '000000' }),
+    /MFA verification required/
+  )
+})
+
+test('setUserRoles updates roles and logs out the account\'s existing sessions', async () => {
+  const server = makeServer()
+  await server.ensureDefaultRoles()
+  await register(server, 'alice', 'x')
+  const alice = await server.userStore.getUserByUsername('alice')
+  await server.userStore.updateUser(alice.id, { roleIds: ['role-read-only'] })
+
+  const { sessionToken } = await login(server, 'alice', 'x')
+  assert.notEqual(await server.getSession(sessionToken), null)
+
+  const updated = await server.setUserRoles({ uid: alice.id, roleIds: ['role-admin'] })
+  assert.deepEqual(updated.roleIds, ['role-admin'])
+  assert.equal(await server.getSession(sessionToken), null) // stale permissions invalidated
+
+  await assert.rejects(
+    server.setUserRoles({ uid: alice.id, roleIds: ['role-does-not-exist'] }),
+    /no such role/
+  )
+})
+
+test('listUsers never exposes salt/verifier/totp secrets', async () => {
+  const server = makeServer()
+  await register(server, 'alice', 'x')
+  const [user] = await server.listUsers()
+  assert.equal(user.username, 'alice')
+  assert.equal('salt' in user, false)
+  assert.equal('verifier' in user, false)
+  assert.equal('totp' in user, false)
 })

@@ -30,6 +30,8 @@ const DEFAULT_SESSION_TTL_MS = 12 * 60 * 60 * 1000
 // module-level note in rate-limit/rate-limiter.js on why bucket keys are
 // always built from values that don't themselves leak account
 // existence.
+const DEFAULT_PASSWORD_RESET_TTL_MS = 30 * 60 * 1000
+
 const DEFAULT_RATE_LIMITS = {
   login: { maxAttempts: 10, windowMs: 15 * 60 * 1000 },
   loginClient: { maxAttempts: 30, windowMs: 15 * 60 * 1000 },
@@ -38,7 +40,22 @@ const DEFAULT_RATE_LIMITS = {
   register: { maxAttempts: 20, windowMs: 60 * 60 * 1000 },
   registerClient: { maxAttempts: 30, windowMs: 60 * 60 * 1000 },
   bootstrap: { maxAttempts: 10, windowMs: 30 * 60 * 1000 },
-  bootstrapClient: { maxAttempts: 20, windowMs: 30 * 60 * 1000 }
+  bootstrapClient: { maxAttempts: 20, windowMs: 30 * 60 * 1000 },
+  // Re-proving the current password (the first step of a password change)
+  // is exactly as guessable-at as a login, so it gets the same shape of
+  // budget, just its own bucket — a burst of failed change attempts
+  // shouldn't eat into (or be hidden by) the account's login budget, and
+  // vice versa.
+  passwordChange: { maxAttempts: 10, windowMs: 15 * 60 * 1000 },
+  passwordChangeClient: { maxAttempts: 30, windowMs: 15 * 60 * 1000 },
+  // Keyed by the submitted username (request) or the reset token itself
+  // (complete) — see requestPasswordReset()'s enumeration-defense note.
+  passwordReset: { maxAttempts: 6, windowMs: 60 * 60 * 1000 },
+  passwordResetClient: { maxAttempts: 20, windowMs: 60 * 60 * 1000 },
+  // Not a credential-guessing surface, but still capped against abuse
+  // (hammering the uniqueness check, log spam) — much more generous than
+  // the credential buckets above since there's nothing to guess here.
+  usernameChange: { maxAttempts: 20, windowMs: 60 * 60 * 1000 }
 }
 
 class AuthServer {
@@ -60,6 +77,19 @@ class AuthServer {
    * @param {import('./rate-limit/rate-limiter').RateLimiter} [opts.rateLimiter]
    * @param {object} [opts.rateLimits] overrides for DEFAULT_RATE_LIMITS, merged shallowly per key
    * @param {import('./audit/audit-logger').AuditLogger} [opts.logger]
+   * @param {boolean} [opts.passwordResetEnabled] off by default — see
+   *   requestPasswordReset()'s module note. Turning this on with no
+   *   `passwordResetSender` configured stores reset tokens but never
+   *   delivers them anywhere; that's a valid (if useless) configuration,
+   *   not an error, since "no email client wired up yet" is exactly the
+   *   state this package is meant to support gracefully.
+   * @param {number} [opts.passwordResetTtlMs]
+   * @param {(ctx: { user: object, token: string, expiresAt: number }) => Promise<void>} [opts.passwordResetSender]
+   *   Called with a *public* user record (see publicUser()), the raw
+   *   reset token, and its expiry — build the reset link/email and send
+   *   it however your deployment does email. Not this package's concern
+   *   beyond the hook itself; see README's "Integrating into a new
+   *   project" for the shape.
    */
   constructor ({
     userStore,
@@ -75,7 +105,10 @@ class AuthServer {
     enumerationDefenseSecret = crypto.randomBytes(32),
     rateLimiter = new MemoryRateLimiter(),
     rateLimits = {},
-    logger = new ConsoleAuditLogger()
+    logger = new ConsoleAuditLogger(),
+    passwordResetEnabled = false,
+    passwordResetTtlMs = DEFAULT_PASSWORD_RESET_TTL_MS,
+    passwordResetSender = null
   }) {
     if (!userStore) throw new Error('AuthServer requires a userStore')
     if (!roleStore) throw new Error('AuthServer requires a roleStore')
@@ -94,6 +127,9 @@ class AuthServer {
     this.rateLimiter = rateLimiter
     this.rateLimits = { ...DEFAULT_RATE_LIMITS, ...rateLimits }
     this.logger = logger
+    this.passwordResetEnabled = passwordResetEnabled
+    this.passwordResetTtlMs = passwordResetTtlMs
+    this.passwordResetSender = passwordResetSender
   }
 
   // ---- Rate limiting + audit logging helpers -----------------------------
@@ -159,6 +195,47 @@ class AuthServer {
   async userHasPermission (user, permission) {
     const userRoles = await this.getUserRoles(user)
     return roles.anyRoleHasPermission(userRoles, permission)
+  }
+
+  /** @returns {Promise<object[]>} every user, public fields only (see publicUser()) */
+  async listUsers () {
+    const users = await this.userStore.listUsers()
+    return users.map(publicUser)
+  }
+
+  /**
+   * Admin-facing: reassigns a user's roles wholesale. This class doesn't
+   * know or enforce who's allowed to call it — that's the integrator's
+   * job (e.g. check the caller's own session has role-admin before
+   * calling this, the same way this package's own examples gate invite
+   * creation). Every id in `roleIds` must resolve via roleStore, so a
+   * typo'd or deleted role id fails loudly here rather than silently
+   * granting nothing.
+   *
+   * Invalidates every one of the target user's existing sessions: a
+   * session's permissions are computed once, at login (_createSession()),
+   * from the roles the user had *then* — without this, a demoted user
+   * would keep their old permissions until that session naturally expired.
+   * The caller (the admin) is a different account with their own separate
+   * session, so there's no "except this session" case to thread through
+   * here the way completePasswordChange()/completePasswordReset() need.
+   * @param {object} opts
+   * @param {string} opts.uid
+   * @param {string[]} opts.roleIds
+   * @param {string} [opts.clientKey]
+   */
+  async setUserRoles ({ uid, roleIds, clientKey }) {
+    if (!Array.isArray(roleIds)) throw new Error('roleIds must be an array')
+    const user = await this.userStore.getUserById(uid)
+    if (!user) throw new Error('no such user')
+    for (const roleId of roleIds) {
+      const role = await this.roleStore.getRole(roleId)
+      if (!role) throw new Error(`no such role: ${roleId}`)
+    }
+    const updated = await this.userStore.updateUser(uid, { roleIds, updatedAt: new Date().toISOString() })
+    await this.sessionStore.deleteAllForUser(uid, null)
+    await this._log('user.roles_changed', { uid, clientKey, details: { roleIds } })
+    return publicUser(updated)
   }
 
   // ---- Registration -----------------------------------------------------
@@ -441,6 +518,297 @@ class AuthServer {
     const sessionToken = await this._createSession(user)
     await this._log('mfa.recovery_code.used', { uid: user.id, clientKey, details: { recoveryCodesRemaining: remaining.length, sessionRef: hashRef(sessionToken) } })
     return { sessionToken, recoveryCodesRemaining: remaining.length }
+  }
+
+  /**
+   * Checks a TOTP code or recovery code against `user`, whichever was
+   * supplied (exactly one is expected — if both are, mfaCode wins).
+   * Consumes the recovery code (single-use) on a successful match, same
+   * as verifyMfaRecoveryCode() above. Shared by completePasswordChange()
+   * and completePasswordReset() — both need "prove you still control this
+   * account's second factor" in the same shape, just from a different
+   * entry point than a fresh login.
+   * @returns {Promise<boolean>}
+   */
+  async _verifyAccountMfa (user, { mfaCode, recoveryCode }) {
+    if (mfaCode) {
+      const secretBytes = Buffer.from(user.totp.secret, 'hex')
+      return totp.verifyTotp(secretBytes, mfaCode).matched
+    }
+    if (recoveryCode) {
+      const idx = recoveryCodes.verifyRecoveryCode(user.recoveryCodeHashes, recoveryCode)
+      if (idx === -1) return false
+      const remaining = user.recoveryCodeHashes.slice()
+      remaining.splice(idx, 1)
+      await this.userStore.updateUser(user.id, { recoveryCodeHashes: remaining })
+      return true
+    }
+    return false
+  }
+
+  // ---- Account self-service (username, password) -------------------------
+
+  /**
+   * Renames the account's login username. Does not touch the credential
+   * (salt/verifier) at all — same "stable id, mutable username" pattern
+   * roles already use, so nothing that references this account by uid
+   * (sessions, audit log entries, role assignments) breaks. Callers
+   * should have already established this is the account's own session
+   * (or an admin's, if you choose to allow that — this method itself
+   * doesn't distinguish, same as setUserRoles() above).
+   * @param {object} opts
+   * @param {string} opts.uid
+   * @param {string} opts.newUsername
+   * @param {string} [opts.clientKey]
+   */
+  async changeUsername ({ uid, newUsername, clientKey }) {
+    await this._enforceRateLimit('usernameChange', uid, clientKey, { uid })
+
+    if (!newUsername || typeof newUsername !== 'string') throw new Error('newUsername is required')
+    const user = await this.userStore.getUserById(uid)
+    if (!user) throw new Error('no such user')
+    if (newUsername === user.username) return publicUser(user)
+
+    const existing = await this.userStore.getUserByUsername(newUsername)
+    if (existing) throw new Error('username already taken')
+
+    const updated = await this.userStore.updateUser(uid, { username: newUsername, updatedAt: new Date().toISOString() })
+    await this._log('user.username_changed', { uid, clientKey, details: { oldUsername: user.username, newUsername } })
+    return publicUser(updated)
+  }
+
+  /**
+   * Step 1 of a password change: re-runs the SRP login challenge against
+   * the account's *current* verifier, scoped to an already-known uid
+   * (the caller's own authenticated session) rather than a submitted
+   * username — so, unlike beginLogin(), there's no real account to probe
+   * for and no fake-credential path needed. Proving the current password
+   * is required before a new one can be set, exactly like changing your
+   * password anywhere else requires it — the difference here is the
+   * proof is a fresh SRP exchange, so the current password still never
+   * crosses the network, not even to authorize replacing itself.
+   * @param {object} opts
+   * @param {string} opts.uid
+   * @param {string} opts.clientPublicEphemeral hex (A)
+   * @param {string} [opts.clientKey]
+   */
+  async beginPasswordChange ({ uid, clientPublicEphemeral, clientKey }) {
+    await this._enforceRateLimit('passwordChange', uid, clientKey, { uid })
+
+    const user = await this.userStore.getUserById(uid)
+    if (!user) throw new Error('no such user')
+
+    const { b, B } = await srpServer.beginLoginChallenge({
+      adapter: this.adapter,
+      group: this.group,
+      verifier: user.verifier
+    })
+
+    const challengeId = crypto.randomUUID()
+    await this.challengeStore.put(challengeId, {
+      uid: user.id,
+      salt: user.salt,
+      verifier: user.verifier,
+      serverEphemeralSecret: b,
+      clientPublicEphemeral,
+      purpose: 'password-change',
+      clientKey
+    }, this.challengeTtlMs)
+
+    return { challengeId, salt: user.salt, B, uid: user.id }
+  }
+
+  /**
+   * Step 2: client sends the SRP proof (clientProof) for the *current*
+   * password plus a brand-new (salt, verifier) pair for the password
+   * it's changing to (computed the same way registerUser() receives
+   * one — via SrpRegistration.create() client-side). If MFA is enabled
+   * on this account, a valid `mfaCode` or `recoveryCode` is also
+   * required — a hijacked-but-not-MFA'd session shouldn't be able to
+   * silently strip MFA's protection by just changing the password.
+   *
+   * On success, every other session this account holds is invalidated
+   * (pass `keepSessionToken` — typically the session the request itself
+   * arrived on — so the caller isn't logged out by their own successful
+   * change). Returns `M2`, the server's SRP proof, so the client can
+   * confirm it re-authenticated against the real server (same pattern as
+   * completeLogin()).
+   * @param {object} opts
+   * @param {string} opts.uid
+   * @param {string} opts.challengeId
+   * @param {string} opts.clientProof hex (M1)
+   * @param {string} opts.newSalt hex
+   * @param {string} opts.newVerifier hex
+   * @param {number} [opts.newIterations]
+   * @param {number} [opts.newGroup]
+   * @param {string} [opts.mfaCode]
+   * @param {string} [opts.recoveryCode]
+   * @param {string|null} [opts.keepSessionToken]
+   * @param {string} [opts.clientKey]
+   */
+  async completePasswordChange ({ uid, challengeId, clientProof, newSalt, newVerifier, newIterations = this.pbkdf2Iterations, newGroup = this.group.bits, mfaCode, recoveryCode, keepSessionToken = null, clientKey }) {
+    const challenge = await this.challengeStore.get(challengeId)
+    await this.challengeStore.delete(challengeId) // single use, success or failure
+
+    const fail = async (reason) => {
+      await this._log('user.password_change.failure', { uid, clientKey, details: { reason } })
+      throw new Error('password change failed')
+    }
+
+    if (!challenge || challenge.purpose !== 'password-change' || challenge.uid !== uid) return fail('bad_challenge')
+
+    let result
+    try {
+      result = await srpServer.completeLoginChallenge({
+        adapter: this.adapter,
+        group: this.group,
+        verifier: challenge.verifier,
+        serverEphemeralSecret: challenge.serverEphemeralSecret,
+        clientPublicEphemeral: challenge.clientPublicEphemeral,
+        clientProof,
+        uid: challenge.uid,
+        salt: challenge.salt
+      })
+    } catch {
+      return fail('bad_proof')
+    }
+
+    const user = await this.userStore.getUserById(uid)
+    if (!user) return fail('no_user')
+
+    if (user.totp) {
+      await this._enforceRateLimit('mfa', uid, clientKey, { uid })
+      const ok = await this._verifyAccountMfa(user, { mfaCode, recoveryCode })
+      if (!ok) return fail('bad_mfa')
+    }
+
+    if (newGroup !== this.group.bits) {
+      throw new Error(`client used a ${newGroup}-bit SRP group but this server is configured for ${this.group.bits}-bit`)
+    }
+
+    await this.userStore.updateUser(uid, {
+      salt: newSalt,
+      verifier: newVerifier,
+      iterations: newIterations,
+      group: newGroup,
+      updatedAt: new Date().toISOString()
+    })
+    await this.sessionStore.deleteAllForUser(uid, keepSessionToken)
+
+    await this._log('user.password_changed', { uid, clientKey })
+    return { M2: result.M2 }
+  }
+
+  /**
+   * Requests an email-based password reset for `username`. No-op (but
+   * same response shape and enumeration-safe behavior either way — see
+   * below) unless `passwordResetEnabled` is true on this instance;
+   * that's an intentional off-by-default posture, since a deployment
+   * with no email client wired up has nowhere for the reset link to go.
+   * Wiring one up later is exactly what `passwordResetSender` (a
+   * constructor option) exists for — this method's job is the mechanics
+   * (a single-use, time-limited token bound to the account) regardless
+   * of whether anything's listening on the send side yet.
+   *
+   * Enumeration defense: this always resolves the same way — `{ requested:
+   * true }` — whether or not the username exists, whether or not the
+   * feature is enabled, and whether or not sending the email itself
+   * failed. All of that is only visible in the audit log, never in the
+   * response, mirroring beginLogin()'s fake-credential approach for the
+   * same reason (a "requested" vs. "not found" response would let an
+   * attacker enumerate real usernames for free).
+   * @param {object} opts
+   * @param {string} opts.username
+   * @param {string} [opts.clientKey]
+   * @returns {Promise<{ requested: true }>}
+   */
+  async requestPasswordReset ({ username, clientKey }) {
+    await this._enforceRateLimit('passwordReset', username, clientKey, { username })
+
+    if (!this.passwordResetEnabled) {
+      await this._log('password_reset.disabled_attempt', { username, clientKey })
+      return { requested: true }
+    }
+
+    const user = await this.userStore.getUserByUsername(username)
+    if (!user) {
+      await this._log('password_reset.requested', { username, clientKey, details: { unknownUser: true } })
+      return { requested: true }
+    }
+
+    const token = crypto.randomBytes(32).toString('hex')
+    const expiresAt = Date.now() + this.passwordResetTtlMs
+    await this.sessionStore.put(`password-reset:${token}`, { uid: user.id }, this.passwordResetTtlMs)
+    await this._log('password_reset.requested', { uid: user.id, username, clientKey })
+
+    if (this.passwordResetSender) {
+      try {
+        await this.passwordResetSender({ user: publicUser(user), token, expiresAt })
+      } catch (err) {
+        await this._log('password_reset.send_failed', { uid: user.id, clientKey, details: { message: err.message } })
+      }
+    }
+
+    return { requested: true }
+  }
+
+  /**
+   * Completes a password reset: `token` proves the requester controls
+   * whatever `passwordResetSender` delivered it to (email, presumably),
+   * standing in for "knows the current password" the way completing an
+   * SRP challenge does for changePassword() above — this path exists
+   * specifically for "forgot the password, can't do that proof," so it
+   * can't require it. If MFA is enabled, a valid `mfaCode`/`recoveryCode`
+   * is still required, for the same reason completePasswordChange()
+   * requires it: forgetting a password (or having your email compromised)
+   * should not, by itself, be enough to also strip MFA from an account.
+   * Single-use: the token is consumed whether this call succeeds or not.
+   * @param {object} opts
+   * @param {string} opts.token
+   * @param {string} opts.newSalt hex
+   * @param {string} opts.newVerifier hex
+   * @param {number} [opts.newIterations]
+   * @param {number} [opts.newGroup]
+   * @param {string} [opts.mfaCode]
+   * @param {string} [opts.recoveryCode]
+   * @param {string} [opts.clientKey]
+   */
+  async completePasswordReset ({ token, newSalt, newVerifier, newIterations = this.pbkdf2Iterations, newGroup = this.group.bits, mfaCode, recoveryCode, clientKey }) {
+    if (!this.passwordResetEnabled) throw new Error('password reset is not enabled')
+
+    await this._enforceRateLimit('passwordReset', `token:${token}`, clientKey)
+
+    const pending = await this.sessionStore.get(`password-reset:${token}`)
+    await this.sessionStore.delete(`password-reset:${token}`) // single use, success or failure
+    if (!pending) throw new Error('reset link expired or invalid')
+
+    const user = await this.userStore.getUserById(pending.uid)
+    if (!user) throw new Error('reset link expired or invalid')
+
+    if (user.totp) {
+      await this._enforceRateLimit('mfa', user.id, clientKey, { uid: user.id })
+      const ok = await this._verifyAccountMfa(user, { mfaCode, recoveryCode })
+      if (!ok) {
+        await this._log('password_reset.mfa_failure', { uid: user.id, clientKey })
+        throw new Error('MFA verification required to complete password reset')
+      }
+    }
+
+    if (newGroup !== this.group.bits) {
+      throw new Error(`client used a ${newGroup}-bit SRP group but this server is configured for ${this.group.bits}-bit`)
+    }
+
+    await this.userStore.updateUser(user.id, {
+      salt: newSalt,
+      verifier: newVerifier,
+      iterations: newIterations,
+      group: newGroup,
+      updatedAt: new Date().toISOString()
+    })
+    await this.sessionStore.deleteAllForUser(user.id, null)
+
+    await this._log('password_reset.completed', { uid: user.id, clientKey })
+    return { ok: true }
   }
 
   // ---- Sessions -----------------------------------------------------------

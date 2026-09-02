@@ -112,6 +112,15 @@ class TtlMemoryStore {
   async delete (key) {
     this._entries.delete(key)
   }
+
+  /** Deletes every non-expired entry for which `predicate(key, data)` returns true (also sweeps expired entries it passes over). */
+  async deleteWhere (predicate) {
+    const now = Date.now()
+    for (const [key, entry] of this._entries) {
+      if (now > entry.expiresAt) { this._entries.delete(key); continue }
+      if (predicate(key, entry.data)) this._entries.delete(key)
+    }
+  }
 }
 
 class MemoryChallengeStore extends ChallengeStore {
@@ -134,6 +143,14 @@ class MemorySessionStore extends SessionStore {
   async put (sessionId, data, ttlMs) { return this._impl.put(sessionId, data, ttlMs) }
   async get (sessionId) { return this._impl.get(sessionId) }
   async delete (sessionId) { return this._impl.delete(sessionId) }
+
+  // Real session tokens are bare crypto.randomUUID() strings (no ':');
+  // this store also holds pending MFA/enrollment/password-reset state
+  // under 'prefix:token' keys (see server-auth.js/bootstrap.js) — the
+  // ':' check keeps this from ever deleting one of those by accident.
+  async deleteAllForUser (uid, exceptSessionId) {
+    await this._impl.deleteWhere((key, data) => !key.includes(':') && data.uid === uid && key !== exceptSessionId)
+  }
 }
 
 export { MemoryUserStore, MemoryRoleStore, MemoryChallengeStore, MemorySessionStore }

@@ -141,6 +141,21 @@ shippers ship in the box:
   this package to also manage an encryption key, which is exactly the
   kind of deployment-specific decision this document keeps deferring to
   the integrator.
+- **Password reset tokens live in `SessionStore`** (the same
+  `password-reset:<token>` pattern the MFA/enrollment pending-state
+  entries already use), so they inherit whatever that store's backing is
+  — in-memory by default, meaning a server restart invalidates every
+  outstanding reset link. **Delivering the token is entirely the
+  integrator's job** (`passwordResetSender`) — this package never sends
+  email itself, has no opinion on your email provider, and
+  `requestPasswordReset()`'s enumeration-safe response shape only covers
+  what *this* package returns; a `passwordResetSender` implementation
+  that behaves differently for a known vs. unknown user (e.g. only
+  emailing for real accounts, which is unavoidable — there's nothing to
+  email for a fake one) does not by itself leak anything beyond what
+  `requestPasswordReset()`'s response already doesn't reveal, since an
+  attacker never sees whether the send happened, only the same
+  `{ requested: true }` either way.
 
 ## Reporting a concern
 

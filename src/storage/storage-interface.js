@@ -92,6 +92,18 @@ class SessionStore {
   async get (sessionId) { notImplemented('SessionStore', 'get') }
   /** @param {string} sessionId @returns {Promise<void>} */
   async delete (sessionId) { notImplemented('SessionStore', 'delete') }
+  /**
+   * Deletes every session belonging to `uid` except `exceptSessionId` (if
+   * given). Used after a password change to log out every other device
+   * without also killing the session that just proved it knew the new
+   * (well — old, to authorize the change) password. Implementations that
+   * also reuse this store for other pending state (MFA/enrollment/reset
+   * tokens, namespaced with a ':' in their key by this package's own
+   * convention) must not delete those here — only real session entries.
+   * @param {string} uid @param {string|null} [exceptSessionId]
+   * @returns {Promise<void>}
+   */
+  async deleteAllForUser (uid, exceptSessionId) { notImplemented('SessionStore', 'deleteAllForUser') }
 }
 
 export { UserStore, RoleStore, ChallengeStore, SessionStore }
