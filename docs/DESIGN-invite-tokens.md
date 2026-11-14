@@ -1,8 +1,8 @@
 # Design: invite & credential-reset tokens ("magic links")
 
-**Status:** approved design, not yet implemented. This document is the
-implementation spec; follow it exactly, and update `README.md` and
-`SECURITY.md` (noted at the end) when the code lands.
+**Status:** implemented (`src/invites.js`, see the test suite in
+`test/invites.test.js`). This document remains the design reference;
+`README.md` and `SECURITY.md` carry the user-facing documentation.
 
 ## Motivation
 
