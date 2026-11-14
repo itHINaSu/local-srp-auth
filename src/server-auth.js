@@ -38,7 +38,10 @@ const DEFAULT_RATE_LIMITS = {
   register: { maxAttempts: 20, windowMs: 60 * 60 * 1000 },
   registerClient: { maxAttempts: 30, windowMs: 60 * 60 * 1000 },
   bootstrap: { maxAttempts: 10, windowMs: 30 * 60 * 1000 },
-  bootstrapClient: { maxAttempts: 20, windowMs: 30 * 60 * 1000 }
+  bootstrapClient: { maxAttempts: 20, windowMs: 30 * 60 * 1000 },
+  // Shared by InviteManager.preview() and .redeem() (same guessing surface).
+  invite: { maxAttempts: 10, windowMs: 15 * 60 * 1000 },
+  inviteClient: { maxAttempts: 30, windowMs: 15 * 60 * 1000 }
 }
 
 class AuthServer {
@@ -205,6 +208,42 @@ class AuthServer {
     return publicUser(created)
   }
 
+  /**
+   * Creates a "pending" user: a stable uid with no credential yet
+   * (salt/verifier/iterations/group all null). An invite (see invites.js)
+   * later installs the credential. Shares registerUser's `register` rate
+   * limit bucket. Who may call this is the application's decision.
+   * @param {object} opts
+   * @param {string} opts.username
+   * @param {string[]} [opts.roleIds]
+   * @param {string} [opts.clientKey]
+   */
+  async createPendingUser ({ username, roleIds = [], clientKey }) {
+    if (!username || typeof username !== 'string') throw new Error('username is required')
+
+    await this._enforceRateLimit('register', username, clientKey, { username })
+
+    const existing = await this.userStore.getUserByUsername(username)
+    if (existing) throw new Error('username already taken')
+
+    const user = {
+      id: crypto.randomUUID(),
+      username,
+      salt: null,
+      verifier: null,
+      iterations: null,
+      group: null,
+      roleIds,
+      totp: null,
+      recoveryCodeHashes: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: null
+    }
+    const created = await this.userStore.createUser(user)
+    await this._log('user.pending_created', { uid: created.id, username, clientKey })
+    return publicUser(created)
+  }
+
   // ---- Login (SRP) -------------------------------------------------------
 
   /**
@@ -221,7 +260,10 @@ class AuthServer {
     // usernames any more than the fake-credential response shape can.
     await this._enforceRateLimit('login', username, clientKey, { username })
 
-    const realUser = await this.userStore.getUserByUsername(username)
+    // A pending user (no credential yet) takes the same fake-credential
+    // path as a nonexistent username, so it is indistinguishable from one.
+    const found = await this.userStore.getUserByUsername(username)
+    const realUser = found && found.verifier ? found : null
     const credential = realUser
       ? { uid: realUser.id, salt: realUser.salt, verifier: realUser.verifier }
       : this._deriveFakeCredential(username)

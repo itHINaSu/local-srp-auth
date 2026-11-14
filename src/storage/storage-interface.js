@@ -8,8 +8,9 @@
 //
 // Two reference implementations ship in this package: memory-store.js
 // (for tests and quick starts) and json-file-store.js (atomic-write JSON
-// file, for small single-instance deployments). Both implement all four
-// interfaces below.
+// file, for small single-instance deployments). Both implement all the
+// interfaces below, except InviteStore, which is only required if you use
+// InviteManager (src/invites.js).
 
 function notImplemented (className, methodName) {
   throw new Error(`${className}.${methodName}() is not implemented — extend the base class and implement it`)
@@ -19,10 +20,10 @@ function notImplemented (className, methodName) {
  * @typedef {object} UserRecord
  * @property {string} id stable, never reused, never changes
  * @property {string} username mutable, unique, used only for login lookup
- * @property {string} salt hex
- * @property {string} verifier hex
- * @property {number} iterations PBKDF2 iterations used for this user's x
- * @property {number} group SRP group bit size used for this user's verifier
+ * @property {string|null} salt hex; null while the user is pending (no credential yet)
+ * @property {string|null} verifier hex; null while pending
+ * @property {number|null} iterations PBKDF2 iterations used for this user's x; null while pending
+ * @property {number|null} group SRP group bit size used for this user's verifier; null while pending
  * @property {string[]} roleIds
  * @property {object|null} totp { secret: hex, enabledAt: string } | null
  * @property {string[]} recoveryCodeHashes hex sha256 hashes, single-use
@@ -92,6 +93,51 @@ class SessionStore {
   async get (sessionId) { notImplemented('SessionStore', 'get') }
   /** @param {string} sessionId @returns {Promise<void>} */
   async delete (sessionId) { notImplemented('SessionStore', 'delete') }
+  /**
+   * Deletes every entry whose stored `uid` field equals `uid` (sessions,
+   * pending-MFA and pending-enrollment entries alike). Optional for
+   * backward compatibility: InviteManager feature-detects it and, if a
+   * store lacks it, emits `invite.sessions_not_revoked` after a credential
+   * reset instead of failing.
+   * @param {string} uid @returns {Promise<void>}
+   */
+  async deleteByUid (uid) { notImplemented('SessionStore', 'deleteByUid') }
 }
 
-export { UserStore, RoleStore, ChallengeStore, SessionStore }
+/**
+ * @typedef {object} InviteRecord
+ * @property {string} id 'invite-' + randomUUID, stable
+ * @property {string} tokenHash hex sha256 of the raw token; the raw token is never stored
+ * @property {string} uid the user this invite is bound to
+ * @property {'activate'|'credential-reset'} purpose
+ * @property {boolean} clearTotp credential-reset only: also remove the user's TOTP on redeem
+ * @property {string|null} createdBy acting admin's uid, for the audit trail
+ * @property {string} createdAt ISO timestamp
+ * @property {string} expiresAt ISO timestamp
+ * @property {string|null} usedAt
+ * @property {string|null} revokedAt
+ */
+
+/** Invite / credential-reset tokens (see src/invites.js). */
+class InviteStore {
+  /** @param {InviteRecord} invite @returns {Promise<InviteRecord>} */
+  async createInvite (invite) { notImplemented('InviteStore', 'createInvite') }
+  /** @param {string} tokenHash @returns {Promise<InviteRecord|null>} */
+  async getInviteByTokenHash (tokenHash) { notImplemented('InviteStore', 'getInviteByTokenHash') }
+  /** @param {string} id @returns {Promise<InviteRecord|null>} */
+  async getInvite (id) { notImplemented('InviteStore', 'getInvite') }
+  /**
+   * Compare-and-set: sets usedAt only if the invite exists and is neither
+   * used nor revoked. This is the single-use guarantee under concurrent
+   * redeems, so it MUST be atomic in your backend (e.g. a conditional
+   * UPDATE ... WHERE used_at IS NULL AND revoked_at IS NULL).
+   * @param {string} id @param {string} usedAt @returns {Promise<boolean>} false if it did not apply
+   */
+  async markUsed (id, usedAt) { notImplemented('InviteStore', 'markUsed') }
+  /** Idempotent. @param {string} id @param {string} revokedAt @returns {Promise<void>} */
+  async revokeInvite (id, revokedAt) { notImplemented('InviteStore', 'revokeInvite') }
+  /** @param {string} uid @returns {Promise<InviteRecord[]>} */
+  async listInvitesForUser (uid) { notImplemented('InviteStore', 'listInvitesForUser') }
+}
+
+export { UserStore, RoleStore, ChallengeStore, SessionStore, InviteStore }

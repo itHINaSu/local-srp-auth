@@ -1,4 +1,4 @@
-// JSON-file-backed UserStore and RoleStore, for small single-instance
+// JSON-file-backed UserStore, RoleStore and InviteStore, for small single-instance
 // deployments (or "I just want to try this out with a real file, not a
 // database, yet"). Every write goes through the same
 // write-to-temp-then-rename pattern used elsewhere for atomic config
@@ -17,7 +17,7 @@
 
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { UserStore, RoleStore } from './storage-interface.js'
+import { UserStore, RoleStore, InviteStore } from './storage-interface.js'
 
 class JsonFileCollection {
   constructor (filePath) {
@@ -160,4 +160,54 @@ class JsonFileRoleStore extends RoleStore {
   }
 }
 
-export { JsonFileUserStore, JsonFileRoleStore }
+class JsonFileInviteStore extends InviteStore {
+  constructor (filePath) {
+    super()
+    this._collection = new JsonFileCollection(filePath)
+  }
+
+  async createInvite (invite) {
+    return this._collection.withRecords((records) => {
+      if (records.some((r) => r.id === invite.id)) throw new Error(`invite id already exists: ${invite.id}`)
+      if (records.some((r) => r.tokenHash === invite.tokenHash)) throw new Error('invite token hash already exists')
+      records.push({ ...invite })
+      return { ...invite }
+    })
+  }
+
+  async getInviteByTokenHash (tokenHash) {
+    const records = await this._collection.readRecords()
+    const found = records.find((r) => r.tokenHash === tokenHash)
+    return found ? { ...found } : null
+  }
+
+  async getInvite (id) {
+    const records = await this._collection.readRecords()
+    const found = records.find((r) => r.id === id)
+    return found ? { ...found } : null
+  }
+
+  // Runs inside the serialized write queue, so check-and-set is atomic in-process.
+  async markUsed (id, usedAt) {
+    return this._collection.withRecords((records) => {
+      const invite = records.find((r) => r.id === id)
+      if (!invite || invite.usedAt || invite.revokedAt) return false
+      invite.usedAt = usedAt
+      return true
+    })
+  }
+
+  async revokeInvite (id, revokedAt) {
+    return this._collection.withRecords((records) => {
+      const invite = records.find((r) => r.id === id)
+      if (invite && !invite.revokedAt) invite.revokedAt = revokedAt
+    })
+  }
+
+  async listInvitesForUser (uid) {
+    const records = await this._collection.readRecords()
+    return records.filter((r) => r.uid === uid).map((r) => ({ ...r }))
+  }
+}
+
+export { JsonFileUserStore, JsonFileRoleStore, JsonFileInviteStore }

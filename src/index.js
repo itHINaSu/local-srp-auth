@@ -4,15 +4,16 @@
 
 import { AuthServer, publicUser } from './server-auth.js'
 import { Bootstrap } from './bootstrap.js'
+import { InviteManager } from './invites.js'
 import GROUPS from './common/groups.js'
 import { createNodeCryptoAdapter } from './common/crypto-adapter-node.js'
 import * as roles from './roles/roles.js'
 import * as totp from './totp/totp.js'
 import * as base32 from './totp/base32.js'
 import * as recoveryCodes from './totp/recovery-codes.js'
-import { UserStore, RoleStore, ChallengeStore, SessionStore } from './storage/storage-interface.js'
-import { MemoryUserStore, MemoryRoleStore, MemoryChallengeStore, MemorySessionStore } from './storage/memory-store.js'
-import { JsonFileUserStore, JsonFileRoleStore } from './storage/json-file-store.js'
+import { UserStore, RoleStore, ChallengeStore, SessionStore, InviteStore } from './storage/storage-interface.js'
+import { MemoryUserStore, MemoryRoleStore, MemoryChallengeStore, MemorySessionStore, MemoryInviteStore } from './storage/memory-store.js'
+import { JsonFileUserStore, JsonFileRoleStore, JsonFileInviteStore } from './storage/json-file-store.js'
 import { RateLimiter, RateLimitExceededError } from './rate-limit/rate-limiter.js'
 import { MemoryRateLimiter } from './rate-limit/memory-rate-limiter.js'
 import { AuditLogger, ConsoleAuditLogger, NullAuditLogger } from './audit/audit-logger.js'
@@ -28,12 +29,15 @@ const storage = {
   RoleStore,
   ChallengeStore,
   SessionStore,
+  InviteStore,
   MemoryUserStore,
   MemoryRoleStore,
   MemoryChallengeStore,
   MemorySessionStore,
+  MemoryInviteStore,
   JsonFileUserStore,
-  JsonFileRoleStore
+  JsonFileRoleStore,
+  JsonFileInviteStore
 }
 
 const rateLimit = {
@@ -57,6 +61,7 @@ export {
   AuthServer,
   publicUser,
   Bootstrap,
+  InviteManager,
   GROUPS,
   createNodeCryptoAdapter,
   roles,

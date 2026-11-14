@@ -4,8 +4,8 @@ import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs/promises'
 
-import { MemoryUserStore, MemoryRoleStore, MemoryChallengeStore, MemorySessionStore } from '../src/storage/memory-store.js'
-import { JsonFileUserStore, JsonFileRoleStore } from '../src/storage/json-file-store.js'
+import { MemoryUserStore, MemoryRoleStore, MemoryChallengeStore, MemorySessionStore, MemoryInviteStore } from '../src/storage/memory-store.js'
+import { JsonFileUserStore, JsonFileRoleStore, JsonFileInviteStore } from '../src/storage/json-file-store.js'
 
 function sampleUser (overrides = {}) {
   return {
@@ -126,6 +126,99 @@ test('MemoryChallengeStore and MemorySessionStore: put/get/delete and TTL expiry
     await new Promise((resolve) => setTimeout(resolve, 30))
     assert.equal(await store.get('key-2'), null, 'entry should have expired')
   }
+})
+
+function sampleInvite (overrides = {}) {
+  return {
+    id: 'invite-1',
+    tokenHash: 'a'.repeat(64),
+    uid: 'user-1',
+    purpose: 'activate',
+    clearTotp: false,
+    createdBy: 'admin-1',
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60000).toISOString(),
+    usedAt: null,
+    revokedAt: null,
+    ...overrides
+  }
+}
+
+// Runs the same behavioral contract against any InviteStore implementation.
+function describeInviteStoreContract (name, makeStore) {
+  test(`${name}: create + get by id + get by token hash`, async () => {
+    const store = await makeStore()
+    const created = await store.createInvite(sampleInvite())
+    assert.deepEqual(await store.getInvite('invite-1'), created)
+    assert.deepEqual(await store.getInviteByTokenHash('a'.repeat(64)), created)
+    assert.equal(await store.getInvite('nope'), null)
+    assert.equal(await store.getInviteByTokenHash('b'.repeat(64)), null)
+  })
+
+  test(`${name}: rejects duplicate id and duplicate token hash`, async () => {
+    const store = await makeStore()
+    await store.createInvite(sampleInvite())
+    await assert.rejects(store.createInvite(sampleInvite({ tokenHash: 'c'.repeat(64) })))
+    await assert.rejects(store.createInvite(sampleInvite({ id: 'invite-2' })))
+  })
+
+  test(`${name}: markUsed is compare-and-set (second call returns false)`, async () => {
+    const store = await makeStore()
+    await store.createInvite(sampleInvite())
+    const t = new Date().toISOString()
+    assert.equal(await store.markUsed('invite-1', t), true)
+    assert.equal(await store.markUsed('invite-1', new Date().toISOString()), false)
+    assert.equal((await store.getInvite('invite-1')).usedAt, t)
+    assert.equal(await store.markUsed('missing', t), false)
+  })
+
+  test(`${name}: markUsed refuses a revoked invite`, async () => {
+    const store = await makeStore()
+    await store.createInvite(sampleInvite())
+    await store.revokeInvite('invite-1', new Date().toISOString())
+    assert.equal(await store.markUsed('invite-1', new Date().toISOString()), false)
+    assert.equal((await store.getInvite('invite-1')).usedAt, null)
+  })
+
+  test(`${name}: concurrent markUsed has exactly one winner`, async () => {
+    const store = await makeStore()
+    await store.createInvite(sampleInvite())
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => store.markUsed('invite-1', new Date().toISOString()))
+    )
+    assert.equal(results.filter(Boolean).length, 1)
+  })
+
+  test(`${name}: revokeInvite is idempotent and keeps the first revokedAt`, async () => {
+    const store = await makeStore()
+    await store.createInvite(sampleInvite())
+    await store.revokeInvite('invite-1', '2030-01-01T00:00:00.000Z')
+    await store.revokeInvite('invite-1', '2031-01-01T00:00:00.000Z')
+    await store.revokeInvite('missing', '2031-01-01T00:00:00.000Z') // no throw
+    assert.equal((await store.getInvite('invite-1')).revokedAt, '2030-01-01T00:00:00.000Z')
+  })
+
+  test(`${name}: listInvitesForUser returns only that user's invites`, async () => {
+    const store = await makeStore()
+    await store.createInvite(sampleInvite())
+    await store.createInvite(sampleInvite({ id: 'invite-2', tokenHash: 'd'.repeat(64), purpose: 'credential-reset' }))
+    await store.createInvite(sampleInvite({ id: 'invite-3', tokenHash: 'e'.repeat(64), uid: 'user-2' }))
+    const mine = await store.listInvitesForUser('user-1')
+    assert.deepEqual(mine.map((i) => i.id).sort(), ['invite-1', 'invite-2'])
+    assert.deepEqual(await store.listInvitesForUser('nobody'), [])
+  })
+}
+
+describeInviteStoreContract('MemoryInviteStore', async () => new MemoryInviteStore())
+describeInviteStoreContract('JsonFileInviteStore', async () => new JsonFileInviteStore(await tmpFile('invites.json')))
+
+test('MemorySessionStore.deleteByUid deletes only that uid\'s entries', async () => {
+  const store = new MemorySessionStore()
+  await store.put('s1', { uid: 'u1' }, 60000)
+  await store.put('s2', { uid: 'u2' }, 60000)
+  await store.deleteByUid('u1')
+  assert.equal(await store.get('s1'), null)
+  assert.deepEqual(await store.get('s2'), { uid: 'u2' })
 })
 
 let tmpDirPromise = null

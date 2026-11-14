@@ -43,11 +43,15 @@ See `SECURITY.md` for the full protocol and threat-model writeup.
   editable, referenced everywhere by a stable `id` so a rename never
   breaks anything.
 - **Pluggable storage** (`src/storage/`) — `UserStore` / `RoleStore` /
-  `ChallengeStore` / `SessionStore` interfaces; in-memory and JSON-file
+  `ChallengeStore` / `SessionStore` / `InviteStore` interfaces; in-memory and JSON-file
   reference implementations ship in the box, write your own for a real
   database.
 - **First-run bootstrap** (`src/bootstrap.js`) — if no user exists yet,
   a one-time setup token gates creating the first (admin) account.
+- **Invites & credential resets** (`src/invites.js`) — the steady-state
+  version of bootstrap: an admin hands a user a single-use magic-link
+  token to activate a pre-created account or reset a credential. See
+  "Invites & credential resets" below.
 - **Rate limiting** (`src/rate-limit/`) — every credential-guessing entry
   point (login, MFA verification, registration, bootstrap) is
   rate-limited by default, keyed by username/uid (works with zero
@@ -118,6 +122,61 @@ reduced it to (a salt and a verifier at registration; ephemeral protocol
 values at login). It also never touches HTTP directly: wire its methods
 into whatever router/framework your app already uses.
 
+## Invites & credential resets
+
+`InviteManager` generalizes the bootstrap token: an admin pre-creates a
+*pending* user (a stable `uid`, no credential yet), issues a single-use
+invite token, and the invitee opens the link and chooses a password in
+their browser (normal SRP registration — the password never reaches the
+server). The same mechanism resets an existing account's credential;
+there is no self-service reset, the admin is the recovery path.
+
+```js
+import { AuthServer, InviteManager, storage } from 'local-srp-auth'
+
+const invites = new InviteManager(server, {
+  inviteStore: new storage.JsonFileInviteStore('./data/invites.json')
+  // defaultTtlMs: 7 * 24 * 60 * 60 * 1000
+})
+
+// Admin side (authorizing the caller is your app's job):
+const pending = await server.createPendingUser({ username: 'grandma', roleIds: ['role-read'] })
+const { invite, token } = await invites.issue({ uid: pending.id, purpose: 'activate', createdBy: adminUid })
+// `token` exists only in this return value; deliver it however you like.
+
+// Credential reset for an existing user. TOTP is kept unless you pass
+// clearTotp: true (lost-phone recovery):
+await invites.issue({ uid, purpose: 'credential-reset', createdBy: adminUid, clearTotp: false })
+
+// Invitee side (rate-limited; every failure throws the same generic error):
+const who = await invites.preview({ token, clientKey })   // { uid, username, purpose, expiresAt }
+// ...browser runs SrpRegistration.create(), then:
+await invites.redeem({ token, salt, verifier, iterations, group, clientKey })
+
+await invites.revoke(invite.id)
+await invites.listForUser(uid)                            // outstanding-invites admin UI
+```
+
+Notes:
+
+- Issuing revokes any earlier live invite for the same `(uid, purpose)`.
+- Only `sha256(token)` is stored; the raw token is never stored or logged.
+- A pending user is indistinguishable from a nonexistent username to
+  `beginLogin()`, and can never complete a login.
+- A credential reset destroys all of the user's sessions via
+  `SessionStore.deleteByUid(uid)` (new, implemented by
+  `MemorySessionStore`). Custom `SessionStore`s should add it; if it is
+  missing the reset still completes but an `invite.sessions_not_revoked`
+  audit event is emitted so you find out.
+- **Delivery:** this package does not build URLs or send anything. Put
+  the token in the URL *fragment* (`/welcome#token=...`) and POST it from
+  the page, so it stays out of server logs, proxies, and `Referer` headers.
+- Rate limits (`invite`, `inviteClient`) are shared by `preview` and
+  `redeem`; audit events are `invite.issued`, `invite.redeemed`,
+  `invite.revoked`, `invite.failed`, `invite.sessions_revoked`.
+
+Full design: `docs/DESIGN-invite-tokens.md`.
+
 ## Browser-side usage
 
 ```js
@@ -148,7 +207,9 @@ protocol value.
    — it has no dependencies to manage either way, so vendoring costs you
    nothing but a `git subtree`/copy step).
 2. Implement `UserStore`/`RoleStore` for your project's real storage if
-   the JSON-file reference implementation isn't enough (see
+   the JSON-file reference implementation isn't enough (add `InviteStore`
+   too if you use `InviteManager`, and `SessionStore.deleteByUid` for
+   credential resets; see
    `src/storage/storage-interface.js` for the contract).
 3. Wire `AuthServer`'s methods into your HTTP framework's routes — see
    `examples/node-http/server.js` for the full route list.

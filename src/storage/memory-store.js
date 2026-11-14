@@ -4,7 +4,7 @@
 // nothing here is shared across multiple server instances. Swap in
 // json-file-store.js (or your own DB-backed store) for anything real.
 
-import { UserStore, RoleStore, ChallengeStore, SessionStore } from './storage-interface.js'
+import { UserStore, RoleStore, ChallengeStore, SessionStore, InviteStore } from './storage-interface.js'
 
 class MemoryUserStore extends UserStore {
   constructor () {
@@ -112,6 +112,12 @@ class TtlMemoryStore {
   async delete (key) {
     this._entries.delete(key)
   }
+
+  async deleteWhere (predicate) {
+    for (const [key, entry] of this._entries) {
+      if (predicate(entry.data)) this._entries.delete(key)
+    }
+  }
 }
 
 class MemoryChallengeStore extends ChallengeStore {
@@ -134,6 +140,53 @@ class MemorySessionStore extends SessionStore {
   async put (sessionId, data, ttlMs) { return this._impl.put(sessionId, data, ttlMs) }
   async get (sessionId) { return this._impl.get(sessionId) }
   async delete (sessionId) { return this._impl.delete(sessionId) }
+  async deleteByUid (uid) { return this._impl.deleteWhere((data) => data && data.uid === uid) }
 }
 
-export { MemoryUserStore, MemoryRoleStore, MemoryChallengeStore, MemorySessionStore }
+class MemoryInviteStore extends InviteStore {
+  constructor () {
+    super()
+    /** @type {Map<string, import('./storage-interface').InviteRecord>} */
+    this._byId = new Map()
+  }
+
+  async createInvite (invite) {
+    if (this._byId.has(invite.id)) throw new Error(`invite id already exists: ${invite.id}`)
+    for (const existing of this._byId.values()) {
+      if (existing.tokenHash === invite.tokenHash) throw new Error('invite token hash already exists')
+    }
+    this._byId.set(invite.id, { ...invite })
+    return { ...invite }
+  }
+
+  async getInviteByTokenHash (tokenHash) {
+    for (const invite of this._byId.values()) {
+      if (invite.tokenHash === tokenHash) return { ...invite }
+    }
+    return null
+  }
+
+  async getInvite (id) {
+    const invite = this._byId.get(id)
+    return invite ? { ...invite } : null
+  }
+
+  // Synchronous check-and-set inside one async tick: atomic w.r.t. other callers.
+  async markUsed (id, usedAt) {
+    const invite = this._byId.get(id)
+    if (!invite || invite.usedAt || invite.revokedAt) return false
+    invite.usedAt = usedAt
+    return true
+  }
+
+  async revokeInvite (id, revokedAt) {
+    const invite = this._byId.get(id)
+    if (invite && !invite.revokedAt) invite.revokedAt = revokedAt
+  }
+
+  async listInvitesForUser (uid) {
+    return [...this._byId.values()].filter((i) => i.uid === uid).map((i) => ({ ...i }))
+  }
+}
+
+export { MemoryUserStore, MemoryRoleStore, MemoryChallengeStore, MemorySessionStore, MemoryInviteStore }
