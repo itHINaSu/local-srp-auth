@@ -94,7 +94,12 @@ import { AuthServer, Bootstrap, storage } from 'local-srp-auth'
 
 const server = new AuthServer({
   userStore: new storage.JsonFileUserStore('./data/users.json'),
-  roleStore: new storage.JsonFileRoleStore('./data/roles.json')
+  roleStore: new storage.JsonFileRoleStore('./data/roles.json'),
+  // Optional — defaults to MemorySessionStore, which loses every logged-in
+  // session on a restart (including a routine `docker compose restart`,
+  // not just a crash). Pass this if you don't want a restart to force
+  // everyone to log back in.
+  sessionStore: new storage.JsonFileSessionStore('./data/sessions.json')
 })
 await server.ensureDefaultRoles()
 
@@ -115,6 +120,19 @@ server.beginTotpEnrollment(uid)
 server.confirmTotpEnrollment({ pendingToken, code, clientKey })
 server.getSession(sessionToken)
 server.destroySession(sessionToken)
+
+// Account self-service — see "Changing username/password" below.
+server.changeUsername({ uid, newUsername, clientKey })
+server.beginPasswordChange({ uid, clientPublicEphemeral, clientKey })
+server.completePasswordChange({ uid, challengeId, clientProof, newSalt, newVerifier, mfaCode, keepSessionToken, clientKey })
+server.requestPasswordReset({ username, clientKey })   // no-op unless passwordResetEnabled
+server.completePasswordReset({ token, newSalt, newVerifier, mfaCode, clientKey })
+
+// Admin-facing — the caller is responsible for checking the requester is
+// actually an admin (e.g. via userHasPermission()) before calling these;
+// AuthServer itself doesn't know what "admin" means to your app.
+server.listUsers()
+server.setUserRoles({ uid, roleIds, clientKey })
 ```
 
 `AuthServer` never sees a password — only what the browser already
@@ -195,6 +213,64 @@ const { challengeId, salt: s, B, uid } = await postJson('/api/login/begin', { us
 const { M1 } = await client.finish({ password, salt: s, serverPublicEphemeral: B, uid })
 const { M2, sessionToken } = await postJson('/api/login/complete', { challengeId, clientProof: M1 })
 await client.verifyServerProof(M2) // throws if the server can't prove it knows the session key too
+```
+
+## Changing username/password
+
+Renaming is a one-call round trip (`server.changeUsername()` — see
+"Server-side usage" above); nothing changes on the browser side since the
+credential itself isn't touched.
+
+Changing the password re-uses the exact same client classes as login and
+registration — `SrpLoginAttempt` to prove the *current* password (so it
+never has to cross the network, not even to authorize replacing itself),
+then `SrpRegistration.create()` to compute the new (salt, verifier) pair:
+
+```js
+// Step 1: prove you know the current password (same shape as login)
+const client = new SrpLoginAttempt({ adapter })
+const { A } = client.start()
+const begin = await postJson('/api/account/password/begin', { clientPublicEphemeral: A })
+const { M1 } = await client.finish({ password: currentPassword, salt: begin.salt, serverPublicEphemeral: begin.B, uid: begin.uid })
+
+// Step 2: compute the new credential and send both in one call
+const { salt, verifier, iterations, group } = await SrpRegistration.create({ password: newPassword, adapter })
+const { M2 } = await postJson('/api/account/password/complete', {
+  challengeId: begin.challengeId, clientProof: M1,
+  newSalt: salt, newVerifier: verifier, newIterations: iterations, newGroup: group,
+  mfaCode // only required if this account has MFA enabled — see below
+})
+await client.verifyServerProof(M2)
+```
+
+If the account has MFA enabled, `completePasswordChange()` (and
+`completePasswordReset()`, below) both require a valid `mfaCode` or
+`recoveryCode` in addition to the SRP proof — a hijacked-but-not-MFA'd
+session, or a compromised inbox in the reset case, shouldn't be able to
+silently strip MFA off an account just by changing its password. On
+success, every *other* session the account holds is invalidated (pass
+`keepSessionToken` — the session the request itself arrived on — so the
+browser making the change isn't logged out by its own success).
+
+**Password reset (email-based) is off by default** —
+`requestPasswordReset()`/`completePasswordReset()` exist and are fully
+functional, but `requestPasswordReset()` is a safe no-op (same
+enumeration-safe `{ requested: true }` response either way) unless the
+`AuthServer` was constructed with `passwordResetEnabled: true` and a
+`passwordResetSender` callback that actually delivers the reset
+link/token somewhere (email, typically). Until a deployment wires up its
+own email client, there's simply nowhere for the token to go — the
+mechanics (single-use, time-limited tokens; MFA-gated completion) are
+ready for whenever one exists:
+
+```js
+const server = new AuthServer({
+  userStore, roleStore,
+  passwordResetEnabled: true,
+  passwordResetSender: async ({ user, token, expiresAt }) => {
+    await yourEmailClient.send(user /* public fields only — no secrets */, `https://your-app/reset?token=${token}`)
+  }
+})
 ```
 
 `password` is a local variable that never leaves this scope in any form

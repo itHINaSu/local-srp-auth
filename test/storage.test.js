@@ -5,7 +5,7 @@ import path from 'node:path'
 import fs from 'node:fs/promises'
 
 import { MemoryUserStore, MemoryRoleStore, MemoryChallengeStore, MemorySessionStore, MemoryInviteStore } from '../src/storage/memory-store.js'
-import { JsonFileUserStore, JsonFileRoleStore, JsonFileInviteStore } from '../src/storage/json-file-store.js'
+import { JsonFileUserStore, JsonFileRoleStore, JsonFileInviteStore, JsonFileSessionStore } from '../src/storage/json-file-store.js'
 
 function sampleUser (overrides = {}) {
   return {
@@ -113,9 +113,9 @@ test('MemoryRoleStore and JsonFileRoleStore: create, update (rename), delete, li
   }
 })
 
-test('MemoryChallengeStore and MemorySessionStore: put/get/delete and TTL expiry', async () => {
-  for (const StoreClass of [MemoryChallengeStore, MemorySessionStore]) {
-    const store = new StoreClass()
+test('MemoryChallengeStore, MemorySessionStore, and JsonFileSessionStore: put/get/delete and TTL expiry', async () => {
+  const stores = [new MemoryChallengeStore(), new MemorySessionStore(), new JsonFileSessionStore(await tmpFile('sessions.json'))]
+  for (const store of stores) {
     await store.put('key-1', { hello: 'world' }, 50)
     assert.deepEqual(await store.get('key-1'), { hello: 'world' })
 
@@ -219,6 +219,30 @@ test('MemorySessionStore.deleteByUid deletes only that uid\'s entries', async ()
   await store.deleteByUid('u1')
   assert.equal(await store.get('s1'), null)
   assert.deepEqual(await store.get('s2'), { uid: 'u2' })
+})
+
+test('JsonFileSessionStore persists sessions across separate store instances pointed at the same file — the whole point of it existing (surviving a process restart)', async () => {
+  const filePath = await tmpFile('sessions.json')
+  const storeA = new JsonFileSessionStore(filePath)
+  await storeA.put('session-1', { uid: 'user-1' }, 60000)
+
+  const storeB = new JsonFileSessionStore(filePath) // simulates a fresh process reading the same file after a restart
+  assert.deepEqual(await storeB.get('session-1'), { uid: 'user-1' })
+})
+
+test('JsonFileSessionStore.deleteAllForUser removes only that user\'s real sessions, keeps pending "prefix:token" entries and other users\' sessions', async () => {
+  const store = new JsonFileSessionStore(await tmpFile('sessions.json'))
+  await store.put('session-a1', { uid: 'user-a' }, 60000)
+  await store.put('session-a2', { uid: 'user-a' }, 60000)
+  await store.put('session-b1', { uid: 'user-b' }, 60000)
+  await store.put('mfa:some-token', { uid: 'user-a' }, 60000) // pending state, not a real session — must survive
+
+  await store.deleteAllForUser('user-a', 'session-a2') // keep session-a2 (the caller's own)
+
+  assert.equal(await store.get('session-a1'), null)
+  assert.deepEqual(await store.get('session-a2'), { uid: 'user-a' })
+  assert.deepEqual(await store.get('session-b1'), { uid: 'user-b' })
+  assert.deepEqual(await store.get('mfa:some-token'), { uid: 'user-a' })
 })
 
 let tmpDirPromise = null

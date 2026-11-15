@@ -13,7 +13,7 @@ import * as base32 from './totp/base32.js'
 import * as recoveryCodes from './totp/recovery-codes.js'
 import { UserStore, RoleStore, ChallengeStore, SessionStore, InviteStore } from './storage/storage-interface.js'
 import { MemoryUserStore, MemoryRoleStore, MemoryChallengeStore, MemorySessionStore, MemoryInviteStore } from './storage/memory-store.js'
-import { JsonFileUserStore, JsonFileRoleStore, JsonFileInviteStore } from './storage/json-file-store.js'
+import { JsonFileUserStore, JsonFileRoleStore, JsonFileInviteStore, JsonFileSessionStore } from './storage/json-file-store.js'
 import { RateLimiter, RateLimitExceededError } from './rate-limit/rate-limiter.js'
 import { MemoryRateLimiter } from './rate-limit/memory-rate-limiter.js'
 import { AuditLogger, ConsoleAuditLogger, NullAuditLogger } from './audit/audit-logger.js'
@@ -37,7 +37,8 @@ const storage = {
   MemoryInviteStore,
   JsonFileUserStore,
   JsonFileRoleStore,
-  JsonFileInviteStore
+  JsonFileInviteStore,
+  JsonFileSessionStore
 }
 
 const rateLimit = {

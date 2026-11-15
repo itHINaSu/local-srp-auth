@@ -18,7 +18,7 @@ integrator, and where the cryptographic choices came from.
 | Client trusting a forged TOTP/recovery bypass | Yes | MFA verification happens entirely server-side against the stored secret/hashes; the client never sees or influences the comparison. |
 | Brute-forcing login attempts / credential stuffing | Yes, baseline | Login, MFA verification, registration, bootstrap, and invite redemption are all rate-limited by default (`src/rate-limit/`) — keyed by username/uid out of the box (works with zero wiring, and can't be used to enumerate accounts — see below), with an optional additional per-client-key layer (an IP, typically) for callers that supply one. Defaults are conservative starting points (`DEFAULT_RATE_LIMITS` in `server-auth.js`), fully overridable via the `rateLimits` constructor option. The default `MemoryRateLimiter` is per-process — see "Multi-instance" below. |
 | CSRF / session-token theft via XSS | Yes, if you use the shipped helpers | `src/session-transport.js` provides HttpOnly session cookies (JS can't read them, so XSS can't exfiltrate them directly) plus double-submit CSRF cookie/header verification. `AuthServer` itself still only deals in an opaque token string — these helpers are opt-in but ready to use, see `examples/node-http/server.js` for the full wiring. |
-| Multi-instance / distributed deployment consistency | Partially | `JsonFileUserStore`/`JsonFileRoleStore` are safe for one process (atomic write + in-process write queue) but not for multiple instances writing the same file. `ChallengeStore`/`SessionStore`/`MemoryRateLimiter` default to in-memory (lost on restart, not shared across instances) — pass your own Redis-backed (or similar) implementation of those interfaces for a real multi-instance deployment. |
+| Multi-instance / distributed deployment consistency | Partially | `JsonFileUserStore`/`JsonFileRoleStore`/`JsonFileSessionStore` are safe for one process (atomic write + in-process write queue) but not for multiple instances writing the same file. `ChallengeStore` and `MemoryRateLimiter` default to in-memory (lost on restart, not shared across instances) — pass your own Redis-backed (or similar) implementation of any of these interfaces for a real multi-instance deployment. |
 | Timing side channels | Best-effort | Recovery-code, TOTP-secret, CSRF-token, and SRP proof (M1/M2) comparisons all use `crypto.timingSafeEqual` or an equivalent constant-time byte comparison — see the comments in `srp-server.js`/`srp-client.js` and `session-transport.js`. Enumeration resistance (above) addresses the main username-existence timing channel. PBKDF2/modexp costs are inherently data-independent in Node's/the browser's implementations; this package does not add its own variable-time comparisons on secret material. |
 | Attacker deliberately locking a real user out via rate limiting | **Partially — an inherent tradeoff, not a bug** | Because the login rate limit is keyed by the *submitted username string* (required for enumeration resistance, above), an attacker who knows a real username can exhaust that username's budget with wrong-password attempts, denying the real user login for the rest of the window. This is the standard tradeoff every username-keyed rate limiter makes; mitigations (CAPTCHA after N failures, a per-account "notify + allow" exception path, etc.) are application-UX decisions this package doesn't make for you. The per-client-key layer (when a caller supplies one) doesn't have this problem, since an attacker doesn't control the *victim's* IP — but it's optional. |
 | Invite / reset token theft from storage | Yes | `InviteManager` stores only `sha256(token)` in the `InviteStore`; the raw 256-bit token exists server-side only in `issue()`'s return value and is never logged (audit events carry `inviteId`/`uid`/`purpose` only). A stolen database or JSON file cannot be replayed into an account takeover. |
@@ -123,15 +123,23 @@ shippers ship in the box:
 
 ## Known limitations (by design, not oversight)
 
-- **`JsonFileUserStore`/`JsonFileRoleStore` are single-instance.** Fine
-  for a small deployment; write a database-backed `UserStore`/`RoleStore`
-  for anything that needs to scale horizontally.
-- **Default `ChallengeStore`/`SessionStore`/`RateLimiter` are in-memory.**
-  Server restarts drop in-flight logins, active sessions, and rate-limit
-  counters; multiple instances behind a load balancer each enforce their
-  own independent limits rather than a shared one. Pass your own
-  implementation (Redis, a database, etc.) of the relevant interface if
-  that's not acceptable for your deployment.
+- **`JsonFileUserStore`/`JsonFileRoleStore`/`JsonFileSessionStore` are
+  single-instance.** Fine for a small deployment; write a database-backed
+  implementation of the relevant interface for anything that needs to
+  scale horizontally (multiple instances behind a load balancer each
+  writing the same file is not supported).
+- **Default `ChallengeStore`/`SessionStore`/`RateLimiter` are in-memory,
+  meaning a restart drops in-flight logins, active sessions, and
+  rate-limit counters.** `SessionStore` has an easy opt-out —
+  `JsonFileSessionStore` persists sessions to disk, so a restart (routine
+  or crash) doesn't force-log-out everyone; `ChallengeStore` doesn't get
+  the same treatment on purpose (an in-flight login is minutes-old state,
+  losing it just means retrying), and `RateLimiter` doesn't either (its
+  counters are meant to reset on restart no differently than they'd reset
+  by the window elapsing — persisting them isn't a security property
+  worth the complexity). Pass your own implementation (Redis, a database,
+  etc.) of any of these interfaces if the built-in tradeoff isn't
+  acceptable for your deployment.
 - **No account-lockout escape hatch beyond the rate-limit window
   expiring.** There's no admin "unlock this account now" API, no
   CAPTCHA-after-N-failures step-up, and no email-the-user-a-notice flow
@@ -146,6 +154,21 @@ shippers ship in the box:
   this package to also manage an encryption key, which is exactly the
   kind of deployment-specific decision this document keeps deferring to
   the integrator.
+- **Password reset tokens live in `SessionStore`** (the same
+  `password-reset:<token>` pattern the MFA/enrollment pending-state
+  entries already use), so they inherit whatever that store's backing is
+  — in-memory by default, meaning a server restart invalidates every
+  outstanding reset link. **Delivering the token is entirely the
+  integrator's job** (`passwordResetSender`) — this package never sends
+  email itself, has no opinion on your email provider, and
+  `requestPasswordReset()`'s enumeration-safe response shape only covers
+  what *this* package returns; a `passwordResetSender` implementation
+  that behaves differently for a known vs. unknown user (e.g. only
+  emailing for real accounts, which is unavoidable — there's nothing to
+  email for a fake one) does not by itself leak anything beyond what
+  `requestPasswordReset()`'s response already doesn't reveal, since an
+  attacker never sees whether the send happened, only the same
+  `{ requested: true }` either way.
 
 ## Reporting a concern
 
